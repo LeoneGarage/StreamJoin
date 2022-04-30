@@ -139,7 +139,7 @@ class StreamingJoin:
            joinKeyColumnNames,
            selectCols,
            finalSelectCols):
-    packed = self._left.stream().select(struct('*').alias('left'), lit(None).alias('right')).unionByName(self._right.stream().select(lit(None).alias('left'), struct('*').alias('right')))
+    packed = self._left.stream().select(F.struct('*').alias('left'), F.lit(None).alias('right')).unionByName(self._right.stream().select(F.lit(None).alias('left'), F.struct('*').alias('right')))
     spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
     return (
       packed
@@ -393,15 +393,21 @@ class Stream:
   
   @staticmethod
   def fromPath(path, startingVersion = None):
-    stream = Stream(spark.readStream.format('delta').option("readChangeFeed", "true").load(path).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp'),
-                 spark.read.format('delta').load(path))
+    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
+    if startingVersion is not None:
+      cdfStream.option("startingVersion", "{startingVersion}")
+    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp')
+    stream = Stream(cdfStream, spark.read.format('delta').load(path))
     stream.setPath(path)
     return stream
 
   @staticmethod
-  def fromTable(tableName):
-    return Stream(spark.readStream.format('delta').option("readChangeFeed", "true").table(tableName).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp'),
-                 spark.read.format('delta').table(tableName))
+  def fromTable(tableName, startingVersion = None):
+    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
+    if startingVersion is not None:
+      cdfStream.option("startingVersion", "{startingVersion}")
+    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp')
+    return Stream(cdfStream, spark.read.format('delta').table(tableName))
 
   def __getitem__(self, key):
     return ColumnSelector(self, key)
