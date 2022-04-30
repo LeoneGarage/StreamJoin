@@ -88,6 +88,7 @@ orders_stream = (
 
 # COMMAND ----------
 
+spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
 (customer_stream
   .writeStream
   .format('delta')
@@ -96,6 +97,7 @@ orders_stream = (
 
 # COMMAND ----------
 
+spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
 (transaction_stream
   .writeStream
   .format('delta')
@@ -104,6 +106,7 @@ orders_stream = (
 
 # COMMAND ----------
 
+spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
 (orders_stream
   .writeStream
   .format('delta')
@@ -129,12 +132,14 @@ a = (
         .to(lambda df: df.withColumn('customer_operation', df['operation']).drop('operation')) # drop duplicate operation columns and rename customer's oeration to customer_operation
         .to(lambda df: df.withColumn('customer_operation_date', df['operation_date']).drop('operation_date')) # drop duplicate operation_date columns and rename customer's operation_date to customer_operation_date
         .primaryKeys('customer_id')
+        .sequenceBy('customer_operation_date')
     )
 
 b = (
       Stream.fromPath(f'{silver_path}/transactions')
       .to(lambda df: df.withColumnRenamed('id', 'transaction_id'))
       .primaryKeys('transaction_id')
+      .sequenceBy('operation_date')
     )
 
 c = (
@@ -143,6 +148,7 @@ c = (
             .to(lambda df: df.withColumnRenamed('operation', 'order_operation'))
             .to(lambda df: df.withColumnRenamed('operation_date', 'order_operation_date'))
             .primaryKeys('order_id')
+            .sequenceBy('order_operation_date')
     )
 
 j = (
@@ -160,14 +166,14 @@ j = (
 
 # COMMAND ----------
 
-a = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
-b = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
-o = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
-c = b.join(a, b['customer_id'] == a['customer_id']).drop(a['customer_id']).join(o, o['transaction_id'] == b['transaction_id']).drop(b['transaction_id'])
+aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
+bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
+oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
+cc = bb.join(aa, bb['customer_id'] == aa['customer_id']).drop(aa['customer_id']).join(oo, oo['transaction_id'] == bb['transaction_id']).drop(bb['transaction_id'])
 
 # COMMAND ----------
 
-df = spark.read.format('delta').load(f'{gold_path}/joined').select(c.columns)
+df = spark.read.format('delta').load(f'{gold_path}/joined').select(cc.columns)
 df.count()
 
 # COMMAND ----------
@@ -176,5 +182,5 @@ display(df)
 
 # COMMAND ----------
 
-print(df.exceptAll(c).count())
-print(c.exceptAll(df).count())
+print(df.exceptAll(cc).count())
+print(cc.exceptAll(df).count())
