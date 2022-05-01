@@ -111,7 +111,7 @@ class StreamingQuery:
                streamingQuery):
     self._streamingQuery = streamingQuery
   
-  def _append(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery):
     self._dependentQuery = dependentQuery
     return self
     
@@ -152,7 +152,7 @@ class StreamingJoin:
     self._right = right
     self._mergeFunc = mergeFunc
 
-  def _append(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery):
     self._dependentQuery = dependentQuery
     return self
 
@@ -186,13 +186,14 @@ class StreamingJoin:
         .writeStream 
         .foreachBatch(self._merge(joinExpr, joinKeyColumnNames, selectCols, finalSelectCols))
       )
-    )._append(self._dependentQuery)
+    )._chainStreamingQuery(self._dependentQuery)
   
 class StreamToStreamJoinWithConditionForEachBatch:
   _left = None
   _right = None
   _joinExpr = None
   _joinKeys = None
+  _partitionColumns = None
   _selectCols = None
   _finalSelectCols = None
   _dependentQuery = None
@@ -202,16 +203,18 @@ class StreamToStreamJoinWithConditionForEachBatch:
                right,
                onCondition,
                joinKeys,
+               partitionColumns,
                selectCols,
                finalSelectCols):
     self._left = left
     self._right = right
     self._joinExpr = onCondition
     self._joinKeys = joinKeys
+    self._partitionColumns = partitionColumns
     self._selectCols = selectCols
     self._finalSelectCols = finalSelectCols
   
-  def _append(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery):
     self._dependentQuery = dependentQuery
     return self
 
@@ -226,13 +229,17 @@ class StreamToStreamJoinWithConditionForEachBatch:
       a = list(dict.fromkeys(a))
     return a
 
+  def partitionBy(self, *columns):
+    self._partitionColumns = columns
+    return self
+
   def foreachBatch(self, mergeFunc):
     return StreamingJoin(self._left,
                self._right,
                mergeFunc).join(self._joinExpr,
                                self._joinKeys,
                                self._selectCols,
-                               self._finalSelectCols)._append(self._dependentQuery)
+                               self._finalSelectCols)._chainStreamingQuery(self._dependentQuery)
 
   def _doMerge(self, deltaTable, cond, primaryKeys, windowSpec, matchCondition, batchDf, batchId):
     if windowSpec is not None:
@@ -253,6 +260,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
     createSql = f'CREATE TABLE IF NOT EXISTS {tableName}({ddl}) USING DELTA'
     if path is not None:
       createSql = f"{createSql} LOCATION '{path}'"
+    if self._partitionColumns is not None:
+      createSql = f"{createSql} PARTITIONED BY ({', '.join([pc for pc in self._partitionColumns])})"
     spark.sql(createSql)
     primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
     sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
@@ -270,7 +279,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
                mergeFunc).join(self._joinExpr,
                                self._joinKeys,
                                self._selectCols,
-                               self._finalSelectCols)._append(self._dependentQuery)
+                               self._finalSelectCols)._chainStreamingQuery(self._dependentQuery)
 
   def generateJoinName(self):
     name = f'$$_{os.path.basename(self._left.path())}_{os.path.basename(self._right.path())}'
@@ -291,7 +300,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
                       .option('checkpointLocation', f'{stagingPath}/cp')
                       .queryName(self.generateJoinName())
                 )
-    return Stream.fromPath(f'{stagingPath}/data').primaryKeys(*self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())).join(right)._append(joinQuery)
+    return Stream.fromPath(f'{stagingPath}/data').primaryKeys(*self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())).join(right)._chainStreamingQuery(joinQuery)
     
   def writeToPath(self, path):
     return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)
@@ -331,18 +340,21 @@ class StreamToStreamJoinWithCondition:
   _joinExpr = None
   _joinKeys = None
   _dependentQuery = None
+  _partitionColumns = None
 
   def __init__(self,
                left,
                right,
                onCondition,
-               joinKeys = None):
+               joinKeys = None,
+               partitionColumns = None):
     self._left = left
     self._right = right
     self._joinExpr = onCondition
     self._joinKeys = joinKeys
+    self._partitionColumns = partitionColumns
 
-  def _append(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery):
     self._dependentQuery = dependentQuery
     return self
 
@@ -350,9 +362,16 @@ class StreamToStreamJoinWithCondition:
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinExpr,
-               keys)._append(self._dependentQuery)
-    
-  def withJoinKeys(self, *keys):
+               keys,
+               self._partitionColumns)._chainStreamingQuery(self._dependentQuery)
+  
+  def stagingPath(self):
+    return self.select('*').generateJoinStagingPath()
+
+  def partitionBy(self, *columns):
+    return self.select('*').partitionBy(*columns)
+
+  def hintJoinKeys(self, *keys):
     return self._onKeys(keys)
   
   def join(self, right, stagingPath = None):
@@ -415,8 +434,9 @@ class StreamToStreamJoinWithCondition:
                self._right,
                self._joinExpr,
                self._joinKeys,
+               self._partitionColumns,
                selectFunc,
-               finalSelectFunc)._append(self._dependentQuery)
+               finalSelectFunc)._chainStreamingQuery(self._dependentQuery)
 
 class StreamToStreamJoin:
   _left = None
@@ -429,21 +449,27 @@ class StreamToStreamJoin:
     self._left = left
     self._right = right
   
-  def _append(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery):
     self._dependentQuery = dependentQuery
     return self
+
+  def stagingPath(self):
+    return StreamToStreamJoinWithCondition(self._left,
+               self._right,
+               [],
+               [])._chainStreamingQuery(self._dependentQuery).stagingPath()
 
   def on(self,
            joinExpr):
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
-               joinExpr)._append(self._dependentQuery)
+               joinExpr)._chainStreamingQuery(self._dependentQuery)
  
   def onKeys(self, *keys):
     joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
-               joinExpr)._append(self._dependentQuery)._onKeys(keys)
+               joinExpr)._chainStreamingQuery(self._dependentQuery)._onKeys(keys)
 
 class Stream:
   _stream = None

@@ -39,7 +39,8 @@ CREATE TABLE delta.`{silver_path}/transactions` ( amount STRING, customer_id STR
 # COMMAND ----------
 
 spark.sql(f'''
-CREATE TABLE delta.`{silver_path}/customers` ( address STRING, email STRING, firstname STRING, id STRING, lastname STRING, operation STRING, operation_date STRING) USING delta
+CREATE TABLE delta.`{silver_path}/customers` ( address STRING, email STRING, firstname STRING, id STRING, lastname STRING, operation STRING, operation_date STRING)
+USING delta
 ''')
 
 # COMMAND ----------
@@ -59,7 +60,7 @@ customer_stream = (
        spark.readStream.format("cloudFiles")
           .option('cloudFiles.format', 'json')
           .option('cloudFiles.schemaLocation', f'{schemaLocation}/customers')
-#          .option('cloudFiles.maxBytesPerTrigger', 20000)
+          .option('cloudFiles.maxBytesPerTrigger', 20000)
           .load(customer_path)
           .drop('_rescued_data')
      )
@@ -70,7 +71,7 @@ transaction_stream = (
        spark.readStream.format("cloudFiles")
           .option('cloudFiles.format', 'json')
           .option('cloudFiles.schemaLocation', f'{schemaLocation}/transactions')
-#          .option('cloudFiles.maxBytesPerTrigger', 100)
+          .option('cloudFiles.maxBytesPerTrigger', 100)
           .load(transaction_path)
           .drop('_rescued_data')
      )
@@ -81,7 +82,7 @@ orders_stream = (
        spark.readStream.format("cloudFiles")
           .option('cloudFiles.format', 'json')
           .option('cloudFiles.schemaLocation', f'{schemaLocation}/orders')
-#          .option('cloudFiles.maxBytesPerTrigger', 100)
+          .option('cloudFiles.maxBytesPerTrigger', 100)
           .load(orders_path)
           .drop('_rescued_data')
      )
