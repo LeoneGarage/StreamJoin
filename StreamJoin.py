@@ -234,12 +234,26 @@ class StreamToStreamJoinWithConditionForEachBatch:
     return self
 
   def foreachBatch(self, mergeFunc):
+    windowSpec = None
+    primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
+    sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
+    if primaryKeys is not None and len(primaryKeys) > 0 and sequenceColumns is not None and len(sequenceColumns) > 0:
+      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
+    def mergeTransformFunc(batchDf, batchId):
+      return mergeFunc(self._dedupBatch(batchDf, windowSpec, primaryKeys), batchId)
     return StreamingJoin(self._left,
                self._right,
-               mergeFunc).join(self._joinExpr,
+               mergeTransformFunc).join(self._joinExpr,
                                self._joinKeys,
                                self._selectCols,
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery)
+
+  def _dedupBatch(self, batchDf, windowSpec, primaryKeys):
+    if windowSpec is not None:
+      batchDf = batchDf.withColumn('row_number', F.row_number().over(windowSpec)).where('row_number = 1')
+    else:
+      batchDf = batchDf.dropDuplicates(primaryKeys)
+    return batchDf
 
   def _doMerge(self, deltaTable, cond, primaryKeys, windowSpec, matchCondition, batchDf, batchId):
     if windowSpec is not None:
