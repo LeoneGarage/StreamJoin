@@ -385,6 +385,9 @@ class StreamToStreamJoinWithCondition:
   def partitionBy(self, *columns):
     return self.select('*').partitionBy(*columns)
 
+  def dedupJoinKeys(self, *keys):
+    return self.hintJoinKeys(*keys)
+
   def hintJoinKeys(self, *keys):
     return self._onKeys(keys)
   
@@ -477,7 +480,8 @@ class StreamToStreamJoin:
            joinExpr):
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
-               joinExpr)._chainStreamingQuery(self._dependentQuery)
+               joinExpr,
+               [])._chainStreamingQuery(self._dependentQuery)
  
   def onKeys(self, *keys):
     joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
