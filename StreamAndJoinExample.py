@@ -82,7 +82,7 @@ orders_stream = (
        spark.readStream.format("cloudFiles")
           .option('cloudFiles.format', 'json')
           .option('cloudFiles.schemaLocation', f'{schemaLocation}/orders')
-          .option('cloudFiles.maxBytesPerTrigger', 100)
+          .option('cloudFiles.maxBytesPerTrigger', 2000000)
           .load(orders_path)
           .drop('_rescued_data')
      )
@@ -154,9 +154,13 @@ c = (
 
 j = (
   a.join(b)
-  .onKeys('customer_id')
+   .on(lambda l, r: l['customer_id'] == r['customer_id'])
+   .dedupJoinKeys('customer_id')
+#  .onKeys('customer_id')
   .join(c)
-  .onKeys('transaction_id')
+  .on(lambda l, r: l['transaction_id'] == r['transaction_id'])
+  .dedupJoinKeys('transaction_id')
+#  .onKeys('transaction_id')
   .writeToPath(f'{gold_path}/joined')
 #  .foreachBatch(mergeGold)
   .option("checkpointLocation", f'{checkpointLocation}/gold/joined')
@@ -169,7 +173,9 @@ j = (
 aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
-cc = bb.join(aa, bb['customer_id'] == aa['customer_id']).drop(aa['customer_id']).join(oo, oo['transaction_id'] == bb['transaction_id']).drop(bb['transaction_id'])
+bb_aa = bb.join(aa, bb['customer_id'] == aa['customer_id']).drop(aa['customer_id'])
+cc = bb_aa.join(oo, oo['transaction_id'] == bb_aa['transaction_id']).drop(oo['transaction_id'])
+cc.count()
 
 # COMMAND ----------
 
@@ -182,5 +188,52 @@ display(df)
 
 # COMMAND ----------
 
-print(df.exceptAll(cc).count())
-print(cc.exceptAll(df).count())
+df_cols = df.columns
+df_cols.sort()
+cc_cols = cc.columns
+cc_cols.sort()
+
+# COMMAND ----------
+
+print(df.select(df_cols).exceptAll(cc.select(cc_cols)).count())
+print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
+
+# COMMAND ----------
+
+display(cc.select(cc_cols).exceptAll(df.select(df_cols)))
+
+# COMMAND ----------
+
+display(df.select(df_cols).exceptAll(cc.select(cc_cols)))
+
+# COMMAND ----------
+
+display(df.select('transaction_id').exceptAll(cc.select('transaction_id')))
+
+# COMMAND ----------
+
+display(df.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+
+# COMMAND ----------
+
+display(cc.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+
+# COMMAND ----------
+
+display(df.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
+
+# COMMAND ----------
+
+display(cc.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
+
+# COMMAND ----------
+
+#%fs
+
+#ls /Users/leon.eller@databricks.com/tmp/demo/both
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC --SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/newRight` WHERE transaction_id is null --ORDER BY ts
