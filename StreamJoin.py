@@ -75,11 +75,11 @@ class MicrobatchJoin:
       selectFunc = lambda f, l, r: f.select(*selectCols(l, r))
       finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(l, r))
 
-    newLeft = self._leftMicrobatch.join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
+    newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
     newLeft = dropDupKeys(joinKeyColumnNames, newLeft, self._rightStatic if joinType == 'inner' or joinType == 'left' else self._leftMicrobatch)
     newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic)
 
-    newRight = self._rightMicrobatch.join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
+    newRight = F.broadcast(self._rightMicrobatch).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
     newRight = dropDupKeys(joinKeyColumnNames, newRight, self._rightMicrobatch if joinType == 'inner' or joinType == 'left' else self._leftStatic)
     newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
 
@@ -88,17 +88,8 @@ class MicrobatchJoin:
 
     joinedOuter = newLeft.join(newRight, joinExpr(newLeft, newRight) & primaryJoinExpr, 'outer').persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(joinedOuter)
-    if joinType == 'inner':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in joinKeyColumnNames])).select(newRight['*'])
-    elif joinType == 'right':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newRight[pk].isNull() & newLeft[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newRight[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
-    elif joinType == 'left':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNotNull() & newRight[pk].isNull()) for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
-    else:
-      raise Exception(f'{joinType} join type is not supported')
+    left = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newRight[pk].isNull() & newLeft[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newLeft['*'])
+    right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNull() & newRight[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNotNull() & newRight[pk].isNotNull() for pk in joinKeyColumnNames]))
     both = dropDupKeys(joinKeyColumnNames, both, newLeft)
     both = selectFunc(both, newLeft, newRight)
@@ -275,11 +266,22 @@ class StreamToStreamJoinWithConditionForEachBatch:
       batchDf = batchDf.dropDuplicates(primaryKeys)
     return batchDf
 
+  def _workOutDeletesForOuterJoins(self, deltaTable, joinType, leftPrimaryKeys, rightPrimaryKeys, batchDf):
+    if joinType != 'inner':
+      targetDf = deltaTable.toDF()
+      if self._joinType == 'left':
+        joinLeftCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in leftPrimaryKeys])
+        joinRightCond = reduce(lambda e, pk: e & pk, [(targetDf[k].isNull() & batchDf[k].isNotNull()) for k in rightPrimaryKeys])
+      elif self._joinType == 'right':
+        joinLeftCond = reduce(lambda e, pk: e & pk, [(targetDf[k].isNull() & batchDf[k].isNotNull()) for k in leftPrimaryKeys])
+        joinRightCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in rightPrimaryKeys])
+      else:
+        raise Exception(f'{self._joinType} join type is not supported')
+      batchDf = targetDf.join(F.broadcast(batchDf), (joinLeftCond & joinRightCond), 'left_semi').withColumn('_delete', F.lit(1)).unionByName(batchDf.withColumn('_delete', F.lit(0)))
+    return batchDf
+
   def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, deleteCondition, matchCondition, batchDf, batchId):
-    if sequenceWindowSpec is not None:
-      batchDf = batchDf.withColumn('row_number', F.row_number().over(sequenceWindowSpec)).where('row_number = 1')
-    else:
-      batchDf = batchDf.dropDuplicates(primaryKeys)    
+    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys)
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
@@ -326,17 +328,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     rightPrimaryKeys = [k for k in primaryKeys if k in self._right.getPrimaryKeys()]
     def mergeFunc(batchDf, batchId):
       deltaTable = deltaTableForFunc()
-      if deleteCondition is not None:
-        targetDf = deltaTable.toDF()
-        if self._joinType == 'left':
-          joinLeftCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in leftPrimaryKeys])
-          joinRightCond = reduce(lambda e, pk: e & pk, [(targetDf[k].isNull() & batchDf[k].isNotNull()) for k in rightPrimaryKeys])
-        elif self._joinType == 'right':
-          joinLeftCond = reduce(lambda e, pk: e & pk, [(targetDf[k].isNull() & batchDf[k].isNotNull()) for k in leftPrimaryKeys])
-          joinRightCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in rightPrimaryKeys])
-        else:
-          raise Exception(f'{self._joinType} join type is not supported')
-        batchDf = targetDf.join(batchDf, (joinLeftCond & joinRightCond), 'left_semi').withColumn('_delete', F.lit(1)).unionByName(batchDf.withColumn('_delete', F.lit(0)))
+      batchDf = self._workOutDeletesForOuterJoins(deltaTable, self._joinType, leftPrimaryKeys, rightPrimaryKeys, batchDf)
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, deleteCondition, matchCondition, batchDf, batchId)
 
     return StreamingJoin(self._left,
