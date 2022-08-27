@@ -75,11 +75,11 @@ class MicrobatchJoin:
       selectFunc = lambda f, l, r: f.select(*selectCols(l, r))
       finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(l, r))
 
-    newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
+    newLeft = F.broadcast(self._leftMicrobatch.where("_change_type != 'delete'")).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
     newLeft = dropDupKeys(joinKeyColumnNames, newLeft, self._rightStatic if joinType == 'inner' or joinType == 'left' else self._leftMicrobatch)
     newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic)
 
-    newRight = F.broadcast(self._rightMicrobatch).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
+    newRight = F.broadcast(self._rightMicrobatch.where("_change_type != 'delete'")).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
     newRight = dropDupKeys(joinKeyColumnNames, newRight, self._rightMicrobatch if joinType == 'inner' or joinType == 'left' else self._leftStatic)
     newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
 
@@ -88,13 +88,25 @@ class MicrobatchJoin:
 
     joinedOuter = newLeft.join(newRight, joinExpr(newLeft, newRight) & primaryJoinExpr, 'outer').persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(joinedOuter)
-    left = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newRight[pk].isNull() & newLeft[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newLeft['*'])
-    right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNull() & newRight[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
+    left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
+    right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in joinKeyColumnNames])).select(newRight['*'])
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNotNull() & newRight[pk].isNotNull() for pk in joinKeyColumnNames]))
     both = dropDupKeys(joinKeyColumnNames, both, newLeft)
     both = selectFunc(both, newLeft, newRight)
     unionDf = left.unionByName(right).unionByName(both)
-    finalDf = finalSelectFunc(unionDf, unionDf, unionDf).persist(StorageLevel.MEMORY_AND_DISK)
+    unionDf = unionDf.where(reduce(lambda e, pk: e | pk, [unionDf[pk].isNotNull() for pk in primaryKeys]))
+    finalDf = finalSelectFunc(unionDf, unionDf, unionDf).withColumn('_change_type', F.lit(None))
+    if joinType == 'left':
+      leftCols = self._leftMicrobatch.columns
+      rightCols = [c for c in self._rightStatic.columns if c not in leftCols]
+      finalDf = finalDf.unionByName(self._leftMicrobatch.where("_change_type = 'delete'").select([self._leftMicrobatch[c] for c in leftCols] + [F.lit(None).alias(c) for c in rightCols]))
+    elif joinType == 'right':
+      rightCols = self._rightMicrobatch.columns
+      leftCols = [c for c in self._leftStatic.columns if c not in rightCols]
+      finalDf = finalDf.unionByName(self._rightMicrobatch.where("_change_type = 'delete'").select([F.lit(None).alias(c) for c in leftCols] + [self._rightMicrobatch[c] for c in rightCols]))
+    elif joinType != 'inner':
+      raise Exception(f'{joinType} join type is not supported')
+    finalDf = finalDf.persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(finalDf)
     return finalDf
   
@@ -261,7 +273,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
 
   def _dedupBatch(self, batchDf, windowSpec, primaryKeys):
     if windowSpec is not None:
-      batchDf = batchDf.withColumn('row_number', F.row_number().over(windowSpec)).where('row_number = 1')
+      batchDf = batchDf.withColumn('_row_number', F.row_number().over(windowSpec)).where('_row_number = 1')
     else:
       batchDf = batchDf.dropDuplicates(primaryKeys)
     return batchDf
@@ -277,11 +289,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
         joinRightCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in rightPrimaryKeys])
       else:
         raise Exception(f'{self._joinType} join type is not supported')
-      batchDf = targetDf.join(F.broadcast(batchDf), (joinLeftCond & joinRightCond), 'left_semi').withColumn('_delete', F.lit(1)).unionByName(batchDf.withColumn('_delete', F.lit(0)))
+      batchDf = targetDf.join(F.broadcast(batchDf), (joinLeftCond & joinRightCond), 'left_semi').withColumn('_change_type', F.lit(None)).withColumn('_delete', F.lit(1)).unionByName(batchDf.withColumn('_delete', F.lit(0)))
     return batchDf
 
   def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, deleteCondition, matchCondition, batchDf, batchId):
-    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys)
+    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys).persist(StorageLevel.MEMORY_AND_DISK)
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
@@ -290,11 +302,12 @@ class StreamToStreamJoinWithConditionForEachBatch:
     mergeChain.whenMatchedUpdate(condition = matchCondition, set = updateCols) \
         .whenNotMatchedInsert(values = updateCols) \
         .execute()
+    batchDf.unpersist()
 
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
-    ddl = self._left.static().join(self._right.static(),
-                                                   self._joinExpr(self._left.static(), self._right.static())).select(self._finalSelectCols(self._left.static(),
-                          self._right.static())).schema.toDDL()
+    ls = self._left.static()
+    rs = self._right.static()
+    ddl = ls.join(rs, self._joinExpr(ls, rs)).select(self._finalSelectCols(ls, rs)).schema.toDDL()
     createSql = f'CREATE TABLE IF NOT EXISTS {tableName}({ddl}) USING DELTA'
     if path is not None:
       createSql = f"{createSql} LOCATION '{path}'"
@@ -307,15 +320,15 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if self._joinType == 'inner':
       cond = ' AND '.join([f'u.{k} = staged_updates.{k}' for k in primaryKeys])
     elif self._joinType == 'left':
-      left_cond = ' AND '.join([f'u.{k} = staged_updates.{k}' for k in primaryKeys if k in self._left.getPrimaryKeys()])
-      right_cond = ' AND '.join([f'(u.{k} = staged_updates.{k} OR (u.{k} is null AND staged_updates.{k} is null))' for k in primaryKeys if k in self._right.getPrimaryKeys()])
-      cond = ' AND '.join([left_cond, right_cond])
-      deleteCondition = ' AND '.join([f'u.{k} is null' for k in primaryKeys if k in self._right.getPrimaryKeys()]) + ' AND staged_updates._delete = 1'
+      left_cond = ' AND '.join([f"u.{k} = staged_updates.{k}" for k in primaryKeys if k in self._left.getPrimaryKeys()])
+      right_cond = ' AND '.join([f'u.{k} <=> staged_updates.{k}' for k in primaryKeys if k in self._right.getPrimaryKeys()])
+      cond = "(staged_updates._change_type != 'delete' AND " + ' AND '.join([left_cond, right_cond]) + ") OR (staged_updates._change_type = 'delete' AND " + ' AND '.join(f'u.{k} <=> staged_updates.{k}' for k in primaryKeys if k in self._left.getPrimaryKeys()) + ')'
+      deleteCondition = "staged_updates._delete = 1 OR staged_updates._change_type = 'delete'"
     elif self._joinType == 'right':
-      right_cond = ' AND '.join([f'u.{k} = staged_updates.{k}' for k in primaryKeys if k in self._right.getPrimaryKeys()])
-      left_cond = ' AND '.join([f'(u.{k} = staged_updates.{k} OR (u.{k} is null AND staged_updates.{k} is null))' for k in primaryKeys if k in self._left.getPrimaryKeys()])
-      cond = ' AND '.join([left_cond, right_cond])
-      deleteCondition = ' AND '.join([f'u.{k} is null' for k in primaryKeys if k in self._left.getPrimaryKeys()]) + ' AND staged_updates._delete = 1'
+      right_cond = ' AND '.join([f'(u.{k} = staged_updates.{k}' for k in primaryKeys if k in self._right.getPrimaryKeys()])
+      left_cond = ' AND '.join([f'(u.{k} <=> staged_updates.{k})' for k in primaryKeys if k in self._left.getPrimaryKeys()])
+      cond = "(staged_updates._change_type != 'delete' AND " + ' AND '.join([left_cond, right_cond]) + ") OR (staged_updates._change_type = 'delete' AND " + ' AND '.join(f'u.{k} <=> staged_updates.{k}' for k in primaryKeys if k in self._right.getPrimaryKeys()) + ')'
+      deleteCondition = "staged_updates._delete = 1 OR staged_updates._change_type = 'delete'"
     else:
       raise Exception(f'{self._joinType} join type is not supported')
     windowSpec = None
@@ -449,16 +462,18 @@ class StreamToStreamJoinWithCondition:
     return self.select('*').writeToTable(tableName)
     
   def select(self, *selectCols):
+    leftStream = self._left.stream().drop('_change_type')
+    rightStream = self._right.stream().drop('_change_type')
     if isinstance(selectCols[0], ColumnSelector):
       leftDict = {}
       expandedCols = []
       for c in selectCols:
         if c.columnName() == '*':
           if c.stream() is self._left.stream():
-            for col in self._left.stream().columns:
+            for col in leftStream.columns:
               expandedCols.append(ColumnSelector(self._left, col))
           elif c.stream() is self._right.stream():
-            for col in self._right.stream().columns:
+            for col in rightStream.columns:
               expandedCols.append(ColumnSelector(self._right, col))
         else:
           expandedCols.append(c)
@@ -485,8 +500,8 @@ class StreamToStreamJoinWithCondition:
     else:
       if isinstance(selectCols, tuple):
         # if '*' is specified convert to columns from left and right minus primary keys on right to avoid dups
-        leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.stream().columns] for c in selectCols if c == '*']
-        rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.stream().columns] for c in selectCols if c == '*']
+        leftStars = [[ColumnSelector(self._left, lc) for lc in leftStream.columns] for c in selectCols if c == '*']
+        rightStars = [[ColumnSelector(self._right, lc) for lc in rightStream.columns] for c in selectCols if c == '*']
         leftCols = [lc for arr in leftStars for lc in arr]
         rightCols = [lc for arr in rightStars for lc in arr if lc.columnName() not in self._joinKeys]
         allCols = leftCols + rightCols
@@ -562,7 +577,7 @@ class Stream:
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp')
+    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage'").drop('_commit_version', '_commit_timestamp')
     stream = Stream(cdfStream, spark.read.format('delta').load(path))
     stream.setPath(path)
     return stream
@@ -572,7 +587,7 @@ class Stream:
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp')
+    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage'").drop('_commit_version', '_commit_timestamp')
     return Stream(cdfStream, spark.read.format('delta').table(tableName))
 
   def __getitem__(self, key):
@@ -587,6 +602,7 @@ class Stream:
 
   def stream(self):
     return self._stream
+
   def static(self):
     return self._static
 

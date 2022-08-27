@@ -153,11 +153,11 @@ c = (
     )
 
 j = (
-  a.join(b)
+  a.join(b, 'left')
    .on(lambda l, r: l['customer_id'] == r['customer_id'])
    .dedupJoinKeys('customer_id')
 #  .onKeys('customer_id')
-  .join(c)
+  .join(c, 'left')
   .on(lambda l, r: l['transaction_id'] == r['transaction_id'])
   .dedupJoinKeys('transaction_id')
 #  .onKeys('transaction_id')
@@ -173,8 +173,8 @@ j = (
 aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
-bb_aa = bb.join(aa, bb['customer_id'] == aa['customer_id']).drop(aa['customer_id'])
-cc = bb_aa.join(oo, oo['transaction_id'] == bb_aa['transaction_id']).drop(oo['transaction_id'])
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'left').drop(bb['customer_id'])
+cc = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'left').drop(oo['transaction_id'])
 cc.count()
 
 # COMMAND ----------
@@ -184,7 +184,31 @@ df.count()
 
 # COMMAND ----------
 
-display(df)
+a_b = spark.read.format('delta').load(f"{a.join(b, 'left').stagingPath()}/data")
+
+# COMMAND ----------
+
+a_b_cols = a_b.columns
+a_b_cols.sort()
+aa_bb_cols = aa_bb.columns
+aa_bb_cols.sort()
+
+# COMMAND ----------
+
+print(a_b.select(a_b_cols).exceptAll(aa_bb.select(aa_bb_cols)).count())
+print(aa_bb.select(aa_bb_cols).exceptAll(a_b.select(a_b_cols)).count())
+
+# COMMAND ----------
+
+display(a_b.select(a_b_cols).exceptAll(aa_bb.select(aa_bb_cols)))
+
+# COMMAND ----------
+
+display(a_b.select(a_b_cols).where("customer_id = 'e6cbdb79-32f0-4490-95ac-e860a0b577c7'"))
+
+# COMMAND ----------
+
+display(aa_bb.select(aa_bb_cols).where("customer_id = 'e6cbdb79-32f0-4490-95ac-e860a0b577c7'"))
 
 # COMMAND ----------
 
@@ -192,6 +216,14 @@ df_cols = df.columns
 df_cols.sort()
 cc_cols = cc.columns
 cc_cols.sort()
+
+# COMMAND ----------
+
+display(a_b.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'"))
+
+# COMMAND ----------
+
+display(DeltaTable.forPath(spark, path = f'{gold_path}/joined').history())
 
 # COMMAND ----------
 
@@ -205,6 +237,18 @@ display(cc.select(cc_cols).exceptAll(df.select(df_cols)))
 # COMMAND ----------
 
 display(df.select(df_cols).exceptAll(cc.select(cc_cols)))
+
+# COMMAND ----------
+
+display(df.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'").orderBy('order_id'))
+
+# COMMAND ----------
+
+display(aa.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'"))
+
+# COMMAND ----------
+
+display(cc.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'").orderBy('order_id'))
 
 # COMMAND ----------
 
