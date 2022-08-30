@@ -10,6 +10,7 @@ import time
 import os
 import hashlib
 import concurrent.futures
+import itertools
 
 # COMMAND ----------
 
@@ -92,17 +93,18 @@ class MicrobatchJoin:
       left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
       right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in joinKeyColumnNames])).select(newRight['*'])
     elif joinType == 'right':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newRight[pk].isNull() & newLeft[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newRight[pk].isNotNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
-    elif joinType == 'left':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNotNull() & newRight[pk].isNull()) for pk in joinKeyColumnNames])).select(newLeft['*'])
+      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
       right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
+    elif joinType == 'left':
+      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
+      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in joinKeyColumnNames])).select(newRight['*'])
     else:
       raise Exception(f'{joinType} join type is not supported')
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNotNull() & newRight[pk].isNotNull() for pk in joinKeyColumnNames]))
     both = dropDupKeys(joinKeyColumnNames, both, newLeft)
     both = selectFunc(both, newLeft, newRight)
     unionDf = left.unionByName(right).unionByName(both)
+    unionDf = unionDf.where(reduce(lambda e, pk: e | pk, [unionDf[pk].isNotNull() for pk in primaryKeys]))
     finalDf = finalSelectFunc(unionDf, unionDf, unionDf).persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(finalDf)
     return finalDf
@@ -118,13 +120,15 @@ class MicrobatchJoin:
 class StreamingQuery:
   _streamingQuery = None
   _dependentQuery = None
+  _upstreamJoinCond = None
 
   def __init__(self,
                streamingQuery):
     self._streamingQuery = streamingQuery
   
-  def _chainStreamingQuery(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
+    self._upstreamJoinCond = upstreamJoinCond
     return self
     
   def option(self, name, value):
@@ -156,6 +160,7 @@ class StreamingJoin:
   _joinType = None
   _mergeFunc = None
   _dependentQuery = None
+  _upstreamJoinCond = None
 
   def __init__(self,
                left,
@@ -167,8 +172,9 @@ class StreamingJoin:
     self._joinType = joinType
     self._mergeFunc = mergeFunc
 
-  def _chainStreamingQuery(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
+    self._upstreamJoinCond = upstreamJoinCond
     return self
 
   def _merge(self,
@@ -202,7 +208,7 @@ class StreamingJoin:
         .writeStream 
         .foreachBatch(self._merge(joinExpr, joinKeyColumnNames, selectCols, finalSelectCols))
       )
-    )._chainStreamingQuery(self._dependentQuery)
+    )._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
   
 class StreamToStreamJoinWithConditionForEachBatch:
   _left = None
@@ -214,6 +220,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
   _selectCols = None
   _finalSelectCols = None
   _dependentQuery = None
+  _upstreamJoinCond = None
 
   def __init__(self,
                left,
@@ -233,8 +240,9 @@ class StreamToStreamJoinWithConditionForEachBatch:
     self._selectCols = selectCols
     self._finalSelectCols = finalSelectCols
   
-  def _chainStreamingQuery(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
+    self._upstreamJoinCond = upstreamJoinCond
     return self
 
   def _safeMergeLists(self, l, r):
@@ -266,28 +274,56 @@ class StreamToStreamJoinWithConditionForEachBatch:
                mergeTransformFunc).join(self._joinExpr,
                                self._joinKeys,
                                self._selectCols,
-                               self._finalSelectCols)._chainStreamingQuery(self._dependentQuery)
+                               self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
   def _dedupBatch(self, batchDf, windowSpec, primaryKeys):
     if windowSpec is not None:
-      batchDf = batchDf.withColumn('row_number', F.row_number().over(windowSpec)).where('row_number = 1')
+      batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
     else:
       batchDf = batchDf.dropDuplicates(primaryKeys)
     return batchDf
 
-  def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, deleteCondition, matchCondition, batchDf, batchId):
-    if sequenceWindowSpec is not None:
-      batchDf = batchDf.withColumn('row_number', F.row_number().over(sequenceWindowSpec)).where('row_number = 1')
-    else:
-      batchDf = batchDf.dropDuplicates(primaryKeys)    
+  def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, batchDf, batchId):
+#    print(f'****** {cond} ******')
+    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys)
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
-    if deleteCondition is not None:
-      mergeChain = mergeChain.whenMatchedDelete(condition = deleteCondition)
     mergeChain.whenMatchedUpdate(condition = matchCondition, set = updateCols) \
         .whenNotMatchedInsert(values = updateCols) \
         .execute()
+
+  def _mergeCondition(self, nonNullableKeys, nullableKeys, extraCond = ''):
+    arr = []
+    for i in range(0, len(nullableKeys)+1):
+      t = list(itertools.combinations(nullableKeys, i))
+      for ii in range(0, len(t)):
+        item = nonNullableKeys.copy()
+        out = [f'u.{pk} = staged_updates.{pk}' for pk in nonNullableKeys]
+        for iii in range(0, len(t[ii])):
+          item += [t[ii][iii]]
+          out += [f'u.{t[ii][iii]} = staged_updates.{t[ii][iii]}']
+        for pk in nullableKeys:
+          if pk not in item:
+            out += [f'u.{pk} is null{extraCond}']
+        arr += [f"({' AND '.join(out)})"]
+    return ' OR '.join(arr)
+
+  def _mergeNonNullKeysForJoin(self, joinType, nonNullKeys, nullKeys, nonNullCandidateKeys, nullCandidateKeys):
+    if joinType == 'inner':
+      return list(dict.fromkeys(nonNullKeys + [pk for pk in nonNullCandidateKeys if pk not in nullKeys]))
+    elif joinType == 'left':
+      return list(dict.fromkeys([pk for pk in nonNullKeys if pk not in nullCandidateKeys] + [pk for pk in nonNullCandidateKeys if pk not in nullKeys]))
+    elif joinType == 'right':
+      return list(dict.fromkeys([pk for pk in nonNullCandidateKeys if pk not in nullKeys] + [pk for pk in nonNullKeys if pk not in nullCandidateKeys]))
+
+  def _mergeNullKeysForJoin(self, joinType, nonNullKeys, nullKeys, nonNullCandidateKeys, nullCandidateKeys):
+    if joinType == 'inner':
+      return list(dict.fromkeys(nullKeys + [pk for pk in nullCandidateKeys if pk not in nonNullKeys and pk not in nullKeys and pk not in nonNullCandidateKeys]))
+    elif joinType == 'left':
+      return list(dict.fromkeys([pk for pk in nullKeys if pk not in nonNullKeys] + [pk for pk in nullCandidateKeys if pk not in nonNullKeys]))
+    elif joinType == 'right':
+      return list(dict.fromkeys([pk for pk in nullKeys if pk not in nonNullKeys] + [pk for pk in nullCandidateKeys if pk not in nullKeys]))
 
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
     ddl = self._left.static().join(self._right.static(),
@@ -301,43 +337,43 @@ class StreamToStreamJoinWithConditionForEachBatch:
     spark.sql(createSql)
     primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
     sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
-    deleteCondition = None
-    if self._joinType == 'inner':
-      cond = ' AND '.join([f'u.{k} = staged_updates.{k}' for k in primaryKeys])
-    elif self._joinType == 'left':
-      left_cond = ' AND '.join([f'u.{k} = staged_updates.{k}' for k in primaryKeys if k in self._left.getPrimaryKeys()])
-      right_cond = ' AND '.join([f'(u.{k} = staged_updates.{k} OR (u.{k} is null AND staged_updates.{k} is null))' for k in primaryKeys if k in self._right.getPrimaryKeys()])
-      cond = ' AND '.join([left_cond, right_cond])
-      deleteCondition = ' AND '.join([f'u.{k} is null' for k in primaryKeys if k in self._right.getPrimaryKeys()]) + ' AND staged_updates._delete = 1'
-    elif self._joinType == 'right':
-      right_cond = ' AND '.join([f'u.{k} = staged_updates.{k}' for k in primaryKeys if k in self._right.getPrimaryKeys()])
-      left_cond = ' AND '.join([f'(u.{k} = staged_updates.{k} OR (u.{k} is null AND staged_updates.{k} is null))' for k in primaryKeys if k in self._left.getPrimaryKeys()])
-      cond = ' AND '.join([left_cond, right_cond])
-      deleteCondition = ' AND '.join([f'u.{k} is null' for k in primaryKeys if k in self._left.getPrimaryKeys()]) + ' AND staged_updates._delete = 1'
-    else:
+    pks = [[], []]
+    if self._upstreamJoinCond is not None:
+      pks = self._upstreamJoinCond()
+#       print(f'%%%%%%%%%% nonNullKeys = {pks[0]}')
+#       print(f'%%%%%%%%%% nullKeys = {pks[1]}')
+    pks1 = self._nonNullAndNullPrimaryKeys(self._joinType,
+                                           [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()],
+                                           [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
+#     print(f'%%%%%%%%%% self._joinType = {self._joinType}')
+#     print(f'%%%%%%%%%% nonNullCandidateKeys = {pks1[0]}')
+#     print(f'%%%%%%%%%% nullCandidateKeys = {pks1[1]}')
+    pks = [self._mergeNonNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1]), self._mergeNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1])]
+#     print(f'%%%%%%%%%% pks[0] = {pks[0]}')
+#     print(f'%%%%%%%%%% pks[1] = {pks[1]}')
+    cond = self._mergeCondition(pks[0], pks[1], ' AND __rn = 1' if self._joinType != 'inner' else '')
+    outerCond = None
+    if self._joinType == 'left' or self._joinType == 'right':
+      outerCond = self._mergeCondition(pks[0], pks[1])
+    elif self._joinType != 'inner':
       raise Exception(f'{self._joinType} join type is not supported')
     windowSpec = None
     matchCondition = None
     if primaryKeys is not None and len(primaryKeys) > 0 and sequenceColumns is not None and len(sequenceColumns) > 0:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
-      matchCondition = ' AND '.join([f'u.{sc} <= staged_updates.{sc}' for sc in sequenceColumns])
+      matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{sc})' for sc in sequenceColumns])
     updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
     leftPrimaryKeys = [k for k in primaryKeys if k in self._left.getPrimaryKeys()]
     rightPrimaryKeys = [k for k in primaryKeys if k in self._right.getPrimaryKeys()]
+    outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
     def mergeFunc(batchDf, batchId):
       deltaTable = deltaTableForFunc()
-      if deleteCondition is not None:
+      if outerCond is not None:
         targetDf = deltaTable.toDF()
-        if self._joinType == 'left':
-          joinLeftCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in leftPrimaryKeys])
-          joinRightCond = reduce(lambda e, pk: e & pk, [(targetDf[k].isNull() & batchDf[k].isNotNull()) for k in rightPrimaryKeys])
-        elif self._joinType == 'right':
-          joinLeftCond = reduce(lambda e, pk: e & pk, [(targetDf[k].isNull() & batchDf[k].isNotNull()) for k in leftPrimaryKeys])
-          joinRightCond = reduce(lambda e, pk: e & pk, [targetDf[k] == batchDf[k] for k in rightPrimaryKeys])
-        else:
-          raise Exception(f'{self._joinType} join type is not supported')
-        batchDf = targetDf.join(batchDf, (joinLeftCond & joinRightCond), 'left_semi').withColumn('_delete', F.lit(1)).unionByName(batchDf.withColumn('_delete', F.lit(0)))
-      self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, deleteCondition, matchCondition, batchDf, batchId)
+        u = targetDf.alias('u')
+        su = F.broadcast(batchDf.alias('staged_updates'))
+        batchDf = u.join(su, F.expr(outerCond), 'right').withColumn('__rn', F.row_number().over(outerWindowSpec)).select(su['*'], F.col('__rn'))
+      self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
 
     return StreamingJoin(self._left,
                self._right,
@@ -345,18 +381,26 @@ class StreamToStreamJoinWithConditionForEachBatch:
                mergeFunc).join(self._joinExpr,
                                self._joinKeys,
                                self._selectCols,
-                               self._finalSelectCols)._chainStreamingQuery(self._dependentQuery)
+                               self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
   def generateJoinName(self):
     name = f'$$_{os.path.basename(self._left.path())}_{os.path.basename(self._right.path())}'
     m = hashlib.sha256()
     m.update(self._left.path().encode('ascii'))
     m.update(self._right.path().encode('ascii'))
-    return f'{name}/{m.hexdigest()}'
+    return f'{name}/{self._joinType}/{m.hexdigest()}'
 
   def generateJoinStagingPath(self):
     dir = os.path.dirname(self._right.path())
     return f'{dir}/{self.generateJoinName()}'
+
+  def _nonNullAndNullPrimaryKeys(self, joinType, leftPrimaryKeys, rightPrimaryKeys):
+      if joinType == 'left':
+        return [leftPrimaryKeys, rightPrimaryKeys]
+      elif joinType == 'right':
+        return [rightPrimaryKeys, leftPrimaryKeys]
+      else:
+        return [(leftPrimaryKeys + rightPrimaryKeys), []]
 
   def join(self, right, joinType = 'inner', stagingPath = None):
     if stagingPath is None:
@@ -366,7 +410,18 @@ class StreamToStreamJoinWithConditionForEachBatch:
                       .option('checkpointLocation', f'{stagingPath}/cp')
                       .queryName(self.generateJoinName())
                 )
-    return Stream.fromPath(f'{stagingPath}/data').primaryKeys(*self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())).join(right, joinType)._chainStreamingQuery(joinQuery)
+    primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
+    if self._upstreamJoinCond is not None:
+      def func():
+        pks = self._upstreamJoinCond()
+        pks1 = self._nonNullAndNullPrimaryKeys(self._joinType,
+                                               [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()],
+                                               [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
+        return [self._mergeNonNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1]), self._mergeNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1])]
+      joinCondFunc = func
+    else:
+      joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
+    return Stream.fromPath(f'{stagingPath}/data').primaryKeys(*primaryKeys).join(right, joinType)._chainStreamingQuery(joinQuery, joinCondFunc)
     
   def writeToPath(self, path):
     return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)
@@ -408,6 +463,7 @@ class StreamToStreamJoinWithCondition:
   _joinKeys = None
   _dependentQuery = None
   _partitionColumns = None
+  _upstreamJoinCond = None
 
   def __init__(self,
                left,
@@ -423,8 +479,9 @@ class StreamToStreamJoinWithCondition:
     self._joinKeys = joinKeys
     self._partitionColumns = partitionColumns
 
-  def _chainStreamingQuery(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
+    self._upstreamJoinCond = upstreamJoinCond
     return self
 
   def _onKeys(self, keys):
@@ -433,7 +490,7 @@ class StreamToStreamJoinWithCondition:
                self._joinType,
                self._joinExpr,
                keys,
-               self._partitionColumns)._chainStreamingQuery(self._dependentQuery)
+               self._partitionColumns)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
   
   def stagingPath(self):
     return self.select('*').generateJoinStagingPath()
@@ -500,6 +557,8 @@ class StreamToStreamJoinWithCondition:
         allCols = leftCols + rightCols
         if len(allCols) > 0:
           return self.select(*allCols)
+        else:
+          return self.select(*([ColumnSelector(self._left, lc) for lc in self._left.stream().columns if lc in selectCols] + [ColumnSelector(self._right, lc) for lc in self._right.stream().columns if lc in selectCols]))
       else:
         selectFunc = selectCols
         finalSelectFunc = selectFunc
@@ -510,13 +569,14 @@ class StreamToStreamJoinWithCondition:
                self._joinKeys,
                self._partitionColumns,
                selectFunc,
-               finalSelectFunc)._chainStreamingQuery(self._dependentQuery)
+               finalSelectFunc)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
 class StreamToStreamJoin:
   _left = None
   _right = None
   _joinType = None
   _dependentQuery = None
+  _upstreamJoinCond = None
 
   def __init__(self,
                left,
@@ -526,8 +586,9 @@ class StreamToStreamJoin:
     self._right = right
     self._joinType = joinType
   
-  def _chainStreamingQuery(self, dependentQuery):
+  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
+    self._upstreamJoinCond = upstreamJoinCond
     return self
 
   def stagingPath(self):
@@ -535,7 +596,7 @@ class StreamToStreamJoin:
                self._right,
                self._joinType,
                [],
-               [])._chainStreamingQuery(self._dependentQuery).stagingPath()
+               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond).stagingPath()
 
   def on(self,
            joinExpr):
@@ -543,14 +604,14 @@ class StreamToStreamJoin:
                self._right,
                self._joinType,
                joinExpr,
-               [])._chainStreamingQuery(self._dependentQuery)
+               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
  
   def onKeys(self, *keys):
     joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinType,
-               joinExpr)._chainStreamingQuery(self._dependentQuery)._onKeys(keys)
+               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)._onKeys(keys)
 
 class Stream:
   _stream = None
@@ -570,7 +631,7 @@ class Stream:
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp')
+    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_version', '_commit_timestamp')
     stream = Stream(cdfStream, spark.read.format('delta').load(path))
     stream.setPath(path)
     return stream
@@ -580,7 +641,7 @@ class Stream:
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage'").drop('_change_type', '_commit_version', '_commit_timestamp')
+    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_version', '_commit_timestamp')
     return Stream(cdfStream, spark.read.format('delta').table(tableName))
 
   def __getitem__(self, key):

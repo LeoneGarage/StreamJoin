@@ -3,6 +3,30 @@
 
 # COMMAND ----------
 
+# import itertools
+
+# #list(itertools.combinations([2, 3, 4], 3))
+
+# def test(nonNullableKeys, nullableKeys):
+#   rightPrimaryKeys = ['2', '3']
+#   arr = []
+#   for i in range(1, len(rightPrimaryKeys)+1):
+#     t = list(itertools.combinations(rightPrimaryKeys, i))
+#     for ii in range(0, len(t)):
+#       item = nonNullableKeys
+#       out = [' AND '.join([f'u.{pk} = s.{pk}' for pk in item])]#['u.1 = s.1']
+#       for iii in range(0, len(t[ii])):
+#         item += [t[ii][iii]]
+#         out += [f'u.{t[ii][iii]} = s.{t[ii][iii]}']
+#       for pk in rightPrimaryKeys:
+#         if pk not in item:
+#           out += [f'u.{pk} is null']
+#       arr += [f"({' AND '.join(out)})"]
+
+#   return ' OR '.join(arr)
+
+# COMMAND ----------
+
 # Enable auto compaction and optimized writes in Delta
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
 spark.conf.set("spark.databricks.delta.autoCompact.enabled","true")
@@ -153,14 +177,10 @@ c = (
     )
 
 j = (
-  a.join(b)
-   .on(lambda l, r: l['customer_id'] == r['customer_id'])
-   .dedupJoinKeys('customer_id')
-#  .onKeys('customer_id')
-  .join(c)
-  .on(lambda l, r: l['transaction_id'] == r['transaction_id'])
-  .dedupJoinKeys('transaction_id')
-#  .onKeys('transaction_id')
+  a.join(b, 'left')
+  .onKeys('customer_id')
+  .join(c, 'left')
+  .onKeys('transaction_id')
   .writeToPath(f'{gold_path}/joined')
 #  .foreachBatch(mergeGold)
   .option("checkpointLocation", f'{checkpointLocation}/gold/joined')
@@ -173,18 +193,24 @@ j = (
 aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
-bb_aa = bb.join(aa, bb['customer_id'] == aa['customer_id']).drop(aa['customer_id'])
-cc = bb_aa.join(oo, oo['transaction_id'] == bb_aa['transaction_id']).drop(oo['transaction_id'])
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'left').drop(bb['customer_id'])
+cc = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'left').drop(oo['transaction_id'])
 cc.count()
+
+# COMMAND ----------
+
+# ab = spark.read.format('delta').load(f"{a.join(b, 'left').stagingPath()}/data")
+# ab_cols = ab.columns
+# ab_cols.sort()
+# aa_bb_cols = aa_bb.columns
+# aa_bb_cols.sort()
+# print(ab.select(ab_cols).exceptAll(aa_bb.select(aa_bb_cols)).count())
+# print(aa_bb.select(aa_bb_cols).exceptAll(ab.select(ab_cols)).count())
 
 # COMMAND ----------
 
 df = spark.read.format('delta').load(f'{gold_path}/joined').select(cc.columns)
 df.count()
-
-# COMMAND ----------
-
-display(df)
 
 # COMMAND ----------
 
@@ -208,15 +234,23 @@ display(df.select(df_cols).exceptAll(cc.select(cc_cols)))
 
 # COMMAND ----------
 
+display(df.select(df_cols).where("customer_id = '9d95ff54-a73d-4d7c-859a-ff8c6b74880e'"))
+
+# COMMAND ----------
+
+display(cc.select(cc_cols).where("customer_id = '9d95ff54-a73d-4d7c-859a-ff8c6b74880e'"))
+
+# COMMAND ----------
+
 display(df.select('transaction_id').exceptAll(cc.select('transaction_id')))
 
 # COMMAND ----------
 
-display(df.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+#display(df.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
 
 # COMMAND ----------
 
-display(cc.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+#display(cc.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
 
 # COMMAND ----------
 
@@ -225,15 +259,3 @@ display(df.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
 # COMMAND ----------
 
 display(cc.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
-
-# COMMAND ----------
-
-#%fs
-
-#ls /Users/leon.eller@databricks.com/tmp/demo/both
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC 
-# MAGIC --SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/newRight` WHERE transaction_id is null --ORDER BY ts
