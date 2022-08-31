@@ -276,16 +276,22 @@ class StreamToStreamJoinWithConditionForEachBatch:
                                self._selectCols,
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
-  def _dedupBatch(self, batchDf, windowSpec, primaryKeys):
+  def _dedupBatch(self, batchDf, windowSpec, primaryKeys, dedupWindowSpec):
     if windowSpec is not None:
-      batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
+      if dedupWindowSpec is not None:
+        batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1 OR __rn = 1')
+      else:
+        batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
     else:
-      batchDf = batchDf.dropDuplicates(primaryKeys)
+      if dedupWindowSpec is None:
+        batchDf = batchDf.dropDuplicates(primaryKeys)
+      else:
+        batchDf = batchDf.withColumn('__row_number', F.row_number().over(dedupWindowSpec)).where('__row_number = 1 OR __rn = 1')
     return batchDf
 
-  def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, batchDf, batchId):
+  def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, dedupWindowSpec, batchDf, batchId):
 #    print(f'****** {cond} ******')
-    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys)
+    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys, dedupWindowSpec)
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
@@ -353,8 +359,10 @@ class StreamToStreamJoinWithConditionForEachBatch:
 #     print(f'%%%%%%%%%% pks[1] = {pks[1]}')
     cond = self._mergeCondition(pks[0], pks[1], ' AND __rn = 1' if self._joinType != 'inner' else '')
     outerCond = None
+    dedupWindowSpec = None
     if self._joinType == 'left' or self._joinType == 'right':
       outerCond = self._mergeCondition(pks[0], pks[1])
+      dedupWindowSpec = Window.partitionBy(primaryKeys).orderBy([F.col(pk) for pk in primaryKeys])
     elif self._joinType != 'inner':
       raise Exception(f'{self._joinType} join type is not supported')
     windowSpec = None
@@ -365,7 +373,10 @@ class StreamToStreamJoinWithConditionForEachBatch:
     updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
     leftPrimaryKeys = [k for k in primaryKeys if k in self._left.getPrimaryKeys()]
     rightPrimaryKeys = [k for k in primaryKeys if k in self._right.getPrimaryKeys()]
-    outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
+    if windowSpec is None:
+      outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
+    else:
+      outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -375,7 +386,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
         u = targetDf.alias('u')
         su = batchDf.alias('staged_updates')
         batchDf = u.join(su, F.expr(outerCond), 'right').withColumn('__rn', F.row_number().over(outerWindowSpec)).select(su['*'], F.col('__rn'))
-      self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
+      self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, dedupWindowSpec, batchDf, batchId)
 
     return StreamingJoin(self._left,
                self._right,
