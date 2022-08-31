@@ -22,9 +22,12 @@ numCustomers = 1000000
 numTransactions = 500000
 numOrders = 5000000
 rowsPerPartition = 10000
+numProducts = 50000000
 
 folder = f"/Users/{user}/tmp/demo/cdc_raw"
-print("Generating the data...")  
+
+# COMMAND ----------
+
 fake = Faker()
 fake.add_provider(faker_commerce.Provider)
 fake_firstname = F.udf(fake.first_name)
@@ -35,6 +38,10 @@ fake_address = F.udf(fake.address)
 operations = OrderedDict([("APPEND", 0.5),("DELETE", 0.1),("UPDATE", 0.3),(None, 0.01)])
 fake_operation = F.udf(lambda:fake.random_elements(elements=operations, length=1)[0])
 fake_id = F.udf(lambda: str(uuid.uuid4()))
+
+# COMMAND ----------
+
+print("Generating the data...")  
 
 df = spark.range(0, numCustomers)
 df = df.withColumn("id", fake_id())
@@ -74,13 +81,29 @@ df.repartition(int(numOrders / rowsPerPartition)).write.format("json").mode("ove
 
 # COMMAND ----------
 
+df = spark.range(0, numProducts)
+fake_product_name = F.udf(lambda: fake.ecommerce_name())
+df = df.withColumn("id", fake_id())
+df = df.withColumn("item_name", fake_product_name())
+df = df.withColumn("item_operation", fake_operation())
+df = df.withColumn("item_operation_date", fake_date())
+df = df.withColumn("price", F.round(F.rand()*10))
+ordersDf = spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0)
+for c in range(int(numProducts / numOrders) - 1):
+  ordersDf = ordersDf.unionByName(spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0))
+df = df.withColumn("t_id", F.monotonically_increasing_id()).join(ordersDf.selectExpr("id as order_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
+df.repartition(int(numProducts / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/products")
+
+# COMMAND ----------
+
 spark.read.json(folder+"/customers").display()
 
 # COMMAND ----------
 
 t = spark.read.json(folder+"/transactions")
 c = spark.read.json(folder+"/customers")
-p = spark.read.json(folder+"/orders")
+o = spark.read.json(folder+"/orders")
+p = spark.read.json(folder+"/products")
 
 # COMMAND ----------
 
@@ -90,5 +113,5 @@ display(j1.groupBy('customer_id').agg(F.count('*').alias('count')).where('count 
 # COMMAND ----------
 
 #display(t.groupBy('customer_id').agg(F.count('*').alias('count')).where('count > 1'))
-j2 = j1.join(p, t['id'] == p['transaction_id'])
+j2 = j1.join(o, t['id'] == p['transaction_id'])
 display(j2.groupBy('transaction_id').agg(F.count('*').alias('count')).where('count > 1'))
