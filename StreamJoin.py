@@ -367,11 +367,13 @@ class StreamToStreamJoinWithConditionForEachBatch:
     rightPrimaryKeys = [k for k in primaryKeys if k in self._right.getPrimaryKeys()]
     outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
     def mergeFunc(batchDf, batchId):
+      batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
+      batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
       if outerCond is not None:
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
-        su = F.broadcast(batchDf.alias('staged_updates'))
+        su = batchDf.alias('staged_updates')
         batchDf = u.join(su, F.expr(outerCond), 'right').withColumn('__rn', F.row_number().over(outerWindowSpec)).select(su['*'], F.col('__rn'))
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
 
