@@ -276,22 +276,15 @@ class StreamToStreamJoinWithConditionForEachBatch:
                                self._selectCols,
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
-  def _dedupBatch(self, batchDf, windowSpec, primaryKeys, dedupWindowSpec):
+  def _dedupBatch(self, batchDf, windowSpec, primaryKeys):
     if windowSpec is not None:
-      if dedupWindowSpec is not None:
-        batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1 OR __rn = 1')
-      else:
-        batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
+      batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
     else:
-      if dedupWindowSpec is None:
-        batchDf = batchDf.dropDuplicates(primaryKeys)
-      else:
-        batchDf = batchDf.withColumn('__row_number', F.row_number().over(dedupWindowSpec)).where('__row_number = 1 OR __rn = 1')
+      batchDf = batchDf.dropDuplicates(primaryKeys)
     return batchDf
 
-  def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, dedupWindowSpec, batchDf, batchId):
+  def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, batchDf, batchId):
 #    print(f'****** {cond} ******')
-    batchDf = self._dedupBatch(batchDf, sequenceWindowSpec, primaryKeys, dedupWindowSpec)
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
@@ -373,20 +366,18 @@ class StreamToStreamJoinWithConditionForEachBatch:
     updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
     leftPrimaryKeys = [k for k in primaryKeys if k in self._left.getPrimaryKeys()]
     rightPrimaryKeys = [k for k in primaryKeys if k in self._right.getPrimaryKeys()]
-    if windowSpec is None:
-      outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
-    else:
-      outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
+    outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
+      batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
       if outerCond is not None:
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
         su = batchDf.alias('staged_updates')
         batchDf = u.join(su, F.expr(outerCond), 'right').withColumn('__rn', F.row_number().over(outerWindowSpec)).select(su['*'], F.col('__rn'))
-      self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, dedupWindowSpec, batchDf, batchId)
+      self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
 
     return StreamingJoin(self._left,
                self._right,
@@ -397,7 +388,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
   def generateJoinName(self):
-    name = f'$$_{os.path.basename(self._left.path())}_{os.path.basename(self._right.path())}'
+    name = f'$$_{self._left.name()}_{self._right.name()}'
     m = hashlib.sha256()
     m.update(self._left.path().encode('ascii'))
     m.update(self._right.path().encode('ascii'))
@@ -434,7 +425,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = func
     else:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
-    return Stream.fromPath(f'{stagingPath}/data').primaryKeys(*primaryKeys).join(right, joinType)._chainStreamingQuery(joinQuery, joinCondFunc)
+    return Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys).join(right, joinType)._chainStreamingQuery(joinQuery, joinCondFunc)
     
   def writeToPath(self, path):
     return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)
@@ -632,6 +623,7 @@ class Stream:
   _primaryKeys = None
   _sequenceColumns = None
   _path = None
+  _name = None
 
   def __init__(self,
                stream,
@@ -645,9 +637,7 @@ class Stream:
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
     cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_version', '_commit_timestamp')
-    stream = Stream(cdfStream, spark.read.format('delta').load(path))
-    stream.setPath(path)
-    return stream
+    return Stream(cdfStream, spark.read.format('delta').load(path)).setPath(path)
 
   @staticmethod
   def fromTable(tableName, startingVersion = None):
@@ -655,11 +645,20 @@ class Stream:
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
     cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_version', '_commit_timestamp')
-    return Stream(cdfStream, spark.read.format('delta').table(tableName))
+    return Stream(cdfStream, spark.read.format('delta').table(tableName)).setName(tableName).setPath(tableName)
 
   def __getitem__(self, key):
     return ColumnSelector(self, key)
   
+  def setName(self, name):
+    self._name = name
+    return self
+
+  def name(self):
+    if self._name is None or len(self._name) == 0:
+      self._name = os.path.basename(self.path())
+    return self._name
+
   def setPath(self, path):
     self._path = path
     return self

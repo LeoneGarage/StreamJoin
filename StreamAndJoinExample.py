@@ -267,11 +267,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-#display(df.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+# display(df.where("order_id = '4f17f32c-2cc2-4a03-a97b-a164fab8e266'"))
 
 # COMMAND ----------
 
-#display(cc.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+# display(cc.where("order_id = '4f17f32c-2cc2-4a03-a97b-a164fab8e266'"))
 
 # COMMAND ----------
 
