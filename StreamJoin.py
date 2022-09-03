@@ -76,11 +76,11 @@ class MicrobatchJoin:
       selectFunc = lambda f, l, r: f.select(*selectCols(l, r))
       finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(l, r))
 
-    newLeft = self._leftMicrobatch.join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
+    newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
     newLeft = dropDupKeys(joinKeyColumnNames, newLeft, self._rightStatic if joinType == 'inner' or joinType == 'left' else self._leftMicrobatch)
     newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic)
 
-    newRight = self._rightMicrobatch.join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
+    newRight = F.broadcast(self._rightMicrobatch).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
     newRight = dropDupKeys(joinKeyColumnNames, newRight, self._rightMicrobatch if joinType == 'inner' or joinType == 'left' else self._leftStatic)
     newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
 
@@ -295,17 +295,20 @@ class StreamToStreamJoinWithConditionForEachBatch:
   def _mergeCondition(self, nonNullableKeys, nullableKeys, extraCond = ''):
     arr = []
     for i in range(0, len(nullableKeys)+1):
-      t = list(itertools.combinations(nullableKeys, i))
+      nullKeys = nullableKeys.copy()
+      t = list(itertools.combinations(nullKeys, i))
       for ii in range(0, len(t)):
         item = nonNullableKeys.copy()
-        out = [f'u.{pk} = staged_updates.{pk}' for pk in nonNullableKeys]
+        out = [f'u.{pk} = staged_updates.{pk}' for pk in item]
         for iii in range(0, len(t[ii])):
           item += [t[ii][iii]]
           out += [f'u.{t[ii][iii]} = staged_updates.{t[ii][iii]}']
-        for pk in nullableKeys:
+        hasNullable = False
+        for pk in nullKeys:
           if pk not in item:
-            out += [f'u.{pk} is null{extraCond}']
-        arr += [f"({' AND '.join(out)})"]
+            out += [f'u.{pk} is null']
+            hasNullable = True
+        arr += [f"({' AND '.join(out)}{extraCond if len(nullableKeys) > 0 else ''})"]
     return ' OR '.join(arr)
 
   def _mergeNonNullKeysForJoin(self, joinType, nonNullKeys, nullKeys, nonNullCandidateKeys, nullCandidateKeys):
@@ -350,34 +353,52 @@ class StreamToStreamJoinWithConditionForEachBatch:
     pks = [self._mergeNonNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1]), self._mergeNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1])]
 #     print(f'%%%%%%%%%% pks[0] = {pks[0]}')
 #     print(f'%%%%%%%%%% pks[1] = {pks[1]}')
-    cond = self._mergeCondition(pks[0], pks[1], ' AND __rn = 1' if self._joinType != 'inner' else '')
+    cond = self._mergeCondition(pks[0], pks[1], ' AND __rn_target = 1 AND __rn_source = 1' if self._joinType != 'inner' else '')
     outerCond = None
     dedupWindowSpec = None
+    joinDedupWindowSpec = None
+    outerWindowSpec = None
+    matchCondition = None
+    insertFilter = None
+    updateFilter = None
     if self._joinType == 'left' or self._joinType == 'right':
       outerCond = self._mergeCondition(pks[0], pks[1])
-      dedupWindowSpec = Window.partitionBy(primaryKeys).orderBy([F.col(pk) for pk in primaryKeys])
+      joinDedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys] + [pk for pk in primaryKeys]).orderBy([F.desc(f'__u_{sc}') for sc in sequenceColumns] if sequenceColumns is not None and len(sequenceColumns) > 0 else [] + ['__rn'])
+      outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys[:1]] if sequenceColumns is None or len(sequenceColumns) == 0 else [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
+      insertFilter = ' AND '.join([f'u.{pk} is null' for pk in primaryKeys])
+      updateFilter = ' OR '.join([f'u.{pk} is not null' for pk in primaryKeys])
+      cond = '__rn = 1 AND ' + ' AND '.join([f'u.{pk} <=> staged_updates.{pk}' for pk in primaryKeys])
     elif self._joinType != 'inner':
       raise Exception(f'{self._joinType} join type is not supported')
     windowSpec = None
-    matchCondition = None
     if primaryKeys is not None and len(primaryKeys) > 0 and sequenceColumns is not None and len(sequenceColumns) > 0:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
-      matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{sc})' for sc in sequenceColumns])
-    updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
+      seqMatchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.__u_{sc})' for sc in sequenceColumns])
+      if matchCondition is not None:
+        matchCondition = ' AND '.join([f'({matchCondition})', f'({seqMatchCondition})'])
+      else:
+        matchCondition = seqMatchCondition
+    updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableForFunc().toDF().columns}
     leftPrimaryKeys = [k for k in primaryKeys if k in self._left.getPrimaryKeys()]
     rightPrimaryKeys = [k for k in primaryKeys if k in self._right.getPrimaryKeys()]
-    outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys])
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
-      batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
-      if outerCond is not None:
+      mergeDf = None
+      if outerCond is None:
+        batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
+      else:
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
-        su = batchDf.alias('staged_updates')
-        batchDf = u.join(su, F.expr(outerCond), 'right').withColumn('__rn', F.row_number().over(outerWindowSpec)).select(su['*'], F.col('__rn'))
+        su = F.broadcast(batchDf).alias('staged_updates')
+        mergeDf = u.join(su, F.expr(outerCond), 'right').persist(StorageLevel.MEMORY_AND_DISK)
+        insertDf = mergeDf.where(insertFilter).select(*[su[c].alias(f'__u_{c}') for c in su.columns], *[su[c].alias(c) for c in primaryKeys]).withColumn('__rn', F.lit(2))
+        updateDf = mergeDf.where(updateFilter).withColumn('__rn', F.row_number().over(outerWindowSpec)).select(*[su[c].alias(f'__u_{c}') for c in su.columns], *[u[c].alias(c) for c in primaryKeys], F.col('__rn'))
+        batchDf = insertDf.unionByName(updateDf).withColumn('__rn2', F.row_number().over(joinDedupWindowSpec)).where('__rn2 = 1').drop('__rn2')
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
+      if mergeDf is not None:
+        mergeDf.unpersist()
 
     return StreamingJoin(self._left,
                self._right,

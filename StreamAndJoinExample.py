@@ -194,9 +194,9 @@ d = (
     )
 
 j = (
-  a.join(b, 'left')
+  a.join(b, 'right')
   .onKeys('customer_id')
-  .join(c, 'left')
+  .join(c, 'right')
   .onKeys('transaction_id')
   .join(d, 'left')
   .onKeys('order_id')
@@ -209,12 +209,28 @@ j = (
 
 # COMMAND ----------
 
+# %sql
+
+# SELECT * FROM ( SELECT row_number() over(partition by 1 order by 1) as data_rn, * FROM data) u
+# JOIN (SELECT row_number() over(partition by 1 order by 1) as batch_rn, * FROM delta.`/Users/leon.eller@databricks.com/tmp/error/batch`) staged_updates ON ((u.transaction_id = staged_updates.transaction_id) AND ((((staged_updates.__rn = 1) AND (u.order_id IS NULL)) AND ((u.customer_id IS NULL) OR (u.customer_id = staged_updates.customer_id))) OR ((u.order_id = staged_updates.order_id) AND (((u.customer_id IS NULL) AND (staged_updates.__rn = 1)) OR (u.customer_id = staged_updates.customer_id)))))
+# WHERE staged_updates.transaction_id = 'a94998e8-4eb6-4919-89e2-996fedced5a6'--u.data_rn=29894
+# -- GROUP BY u.data_rn
+# -- order by count desc
+
+# COMMAND ----------
+
+# %sql
+
+# SELECT *, row_number() OVER(partition by customer_id, transaction_id, order_id ORDER BY customer_id) as rn FROM delta.`/Users/leon.eller@databricks.com/tmp/error/batch` WHERE transaction_id = 'a94998e8-4eb6-4919-89e2-996fedced5a6'
+
+# COMMAND ----------
+
 aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
 pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
-aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'left').drop(bb['customer_id'])
-aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'left').drop(oo['transaction_id'])
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
 cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
 cc.count()
 
@@ -247,6 +263,22 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
+# a = df.withColumn('_rn', F.row_number().over(Window.partitionBy(['customer_id', 'transaction_id', 'order_id', 'product_id']).orderBy(['customer_id']))).where('_rn = 1')
+
+# COMMAND ----------
+
+# display(a.select(df_cols).exceptAll(cc.select(cc_cols)))
+
+# COMMAND ----------
+
+# display(df.select(df_cols).where("product_id = '9cf2fdef-4e0b-480b-b000-d12b63ef9c47'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).where("product_id = '594a89c8-8cb5-4af9-93ce-86ca1e515931'"))
+
+# COMMAND ----------
+
 # display(cc.select(cc_cols).exceptAll(df.select(df_cols)))
 
 # COMMAND ----------
@@ -255,11 +287,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.select(df_cols).where("customer_id = '9d95ff54-a73d-4d7c-859a-ff8c6b74880e'"))
+# display(df.select(df_cols).where("customer_id = 'cd3b7176-ef20-4120-91c0-ff470718d419' and order_id = '411173c8-337f-441c-9586-d68418fc3c66'"))
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("customer_id = '9d95ff54-a73d-4d7c-859a-ff8c6b74880e'"))
+# display(cc.select(cc_cols).where("customer_id = 'cd3b7176-ef20-4120-91c0-ff470718d419' and order_id = '411173c8-337f-441c-9586-d68418fc3c66'"))
 
 # COMMAND ----------
 
@@ -275,8 +307,8 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
+# display(df.select(cc_cols).where("transaction_id = '32dcfab0-6039-4c85-9f83-14a9f66bd0f6'"))
 
 # COMMAND ----------
 
-# display(cc.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
+# display(cc.select(cc_cols).where("transaction_id = '32dcfab0-6039-4c85-9f83-14a9f66bd0f6'"))
