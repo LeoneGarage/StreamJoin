@@ -194,7 +194,7 @@ d = (
     )
 
 j = (
-  a.join(b, 'right')
+  a.join(b, 'left')
   .onKeys('customer_id')
   .join(c, 'right')
   .onKeys('transaction_id')
@@ -229,7 +229,7 @@ aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenam
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
 pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
-aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'left').drop(bb['customer_id'])
 aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
 cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
 cc.count()
@@ -271,11 +271,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.select(df_cols).where("product_id = '9cf2fdef-4e0b-480b-b000-d12b63ef9c47'"))
+# display(df.select(df_cols).where("product_id = '46495eac-cbfe-49ed-96f0-57625cc41799'"))
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("product_id = '594a89c8-8cb5-4af9-93ce-86ca1e515931'"))
+# display(cc.select(cc_cols).where("product_id = '46495eac-cbfe-49ed-96f0-57625cc41799'"))
 
 # COMMAND ----------
 
