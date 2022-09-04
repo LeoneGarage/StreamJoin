@@ -7,6 +7,7 @@
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
 spark.conf.set("spark.databricks.delta.autoCompact.enabled","true")
 spark.conf.set("spark.databricks.delta.properties.defaults.enableChangeDataFeed", True)
+spark.conf.set("spark.databricks.adaptive.autoBroadcastJoinThreshold", "2GB")
 
 # COMMAND ----------
 
@@ -194,11 +195,11 @@ d = (
     )
 
 j = (
-  a.join(b, 'left')
+  a.join(b, 'right')
   .onKeys('customer_id')
-  .join(c, 'right')
+  .join(c)
   .onKeys('transaction_id')
-  .join(d, 'left')
+  .join(d, 'right')
   .onKeys('order_id')
   .writeToPath(f'{gold_path}/joined')
 #  .foreachBatch(mergeGold)
@@ -229,9 +230,9 @@ aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenam
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
 pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
-aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'left').drop(bb['customer_id'])
-aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
-cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id']).drop(oo['transaction_id'])
+cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'right').drop(aa_bb_oo['order_id'])
 cc.count()
 
 # COMMAND ----------
@@ -271,11 +272,55 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.select(df_cols).where("product_id = '46495eac-cbfe-49ed-96f0-57625cc41799'"))
+# path = (a.join(b, 'right')).stagingPath()
+# datatdf = spark.read.format('delta').load(f'{path}/data')
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("product_id = '46495eac-cbfe-49ed-96f0-57625cc41799'"))
+# display(datatdf.where("transaction_id = '91c71211-576a-46c1-bcde-20572e490809'"))
+
+# COMMAND ----------
+
+# path = (a.join(b, 'right')
+#   .onKeys('customer_id')
+#   .join(c)).stagingPath()
+# dataodf = spark.read.format('delta').option('versionAsOf', 5).load(f'{path}/data')
+
+# COMMAND ----------
+
+# DeltaTable.forPath(spark, (a.join(b, 'right')
+#   .onKeys('customer_id')
+#   .join(c)).stagingPath() + '/data').history().display()
+
+# COMMAND ----------
+
+# dataodf.createOrReplaceTempView('test')
+
+# COMMAND ----------
+
+# %sql
+
+# SELECT *, row_number() over(partition by transaction_id, order_id, CASE WHEN customer_id is null then max else customer_id end order by customer_id DESC) as rn FROM (
+# SELECT customer_id, transaction_id, order_id, max(customer_id) over(partition by transaction_id, order_id order by customer_id DESC ) as max
+#   from test
+# )
+# where order_id = 'a60833dd-9df1-401c-9d90-97c4daa1a70e'
+
+# COMMAND ----------
+
+#display(dataodf.where("order_id = '2e949785-1ffe-4fdf-b814-9f1d09cb3ae2'"))
+
+# COMMAND ----------
+
+#display(aa_bb_oo.where("order_id = 'a60833dd-9df1-401c-9d90-97c4daa1a70e'"))
+
+# COMMAND ----------
+
+# display(df.select(df_cols).where("product_id = '0b25468f-16e3-4079-83fd-62239a118336'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).where("product_id = '0b25468f-16e3-4079-83fd-62239a118336'"))
 
 # COMMAND ----------
 

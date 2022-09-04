@@ -353,7 +353,6 @@ class StreamToStreamJoinWithConditionForEachBatch:
     pks = [self._mergeNonNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1]), self._mergeNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1])]
 #     print(f'%%%%%%%%%% pks[0] = {pks[0]}')
 #     print(f'%%%%%%%%%% pks[1] = {pks[1]}')
-#    cond = self._mergeCondition(pks[0], pks[1], ' AND __rn_target = 1 AND __rn_source = 1' if self._joinType != 'inner' else '')
     cond = ' AND '.join([f'u.{pk} = staged_updates.{pk}' for pk in pks[0]] + [f'u.{pk} <=> staged_updates.{pk}' for pk in pks[1]])
     outerCond = None
     dedupWindowSpec = None
@@ -364,6 +363,9 @@ class StreamToStreamJoinWithConditionForEachBatch:
     updateFilter = None
     if len(pks[1]) > 0:#self._joinType == 'left' or self._joinType == 'right':
       outerCond = F.expr(self._mergeCondition(pks[0], pks[1]))
+#       maxWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in pks[0]]).orderBy([F.desc(f'__u_{pk}') for pk in pks[1]])
+#       maxKeys = [F.max(f'__u_{pk}').over(maxWindowSpec).alias(f'__max_{pk}') for pk in pks[1]]
+#       joinDedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in pks[0]] + [F.expr(f'CASE WHEN __u_{pk} is null THEN __max_{pk} ELSE __u_{pk} END') for pk in pks[1]]).orderBy([F.desc(f'__u_{pk}') for pk in pks[1]] + [F.desc(f'__u_{sc}') for sc in sequenceColumns] if sequenceColumns is not None and len(sequenceColumns) > 0 else [] + ['__rn'])
       joinDedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys]).orderBy([F.desc(f'__u_{sc}') for sc in sequenceColumns] if sequenceColumns is not None and len(sequenceColumns) > 0 else [] + ['__rn'])
       outerWindowSpec = Window.partitionBy([f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
@@ -386,6 +388,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if outerCond is not None:
       insertSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.col(f'staged_updates.{c}').alias(c) for c in primaryKeys] + [F.lit(2).alias('__rn')]
       updateSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.col(f'u.{c}').alias(c) for c in primaryKeys] + [F.row_number().over(outerWindowSpec).alias('__rn')]
+      dedupCond = F.expr('(' + ' OR '.join([f's.__u_{pk} is null and d.__u_{pk} is not null' for pk in pks[0]]) + ') AND (' + ' AND '.join([f's.__u_{pk} = d.__u_{pk}' for pk in pks[1]]) + ')')
+      unionSelects = [
+#                        [F.col('*')] + maxKeys,
+                       [F.col(f'__u_{c}') for c in deltaTableColumns] + [F.col(c) for c in primaryKeys] + [F.col('__rn')] + [F.row_number().over(joinDedupWindowSpec).alias('__rn2')]
+                     ]
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -394,17 +401,24 @@ class StreamToStreamJoinWithConditionForEachBatch:
       if outerCond is None:
         batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
       else:
+        batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
         su = F.broadcast(batchDf).alias('staged_updates')
         mergeDf = u.join(su, outerCond, 'right').persist(StorageLevel.MEMORY_AND_DISK)
         insertDf = mergeDf.where(insertFilter).select(insertSelect)
         updateDf = mergeDf.where(updateFilter).select(updateSelect)
-        batchDf = insertDf.unionByName(updateDf).withColumn('__rn2', F.row_number().over(joinDedupWindowSpec)).where('__rn2 = 1').drop('__rn2').persist(StorageLevel.MEMORY_AND_DISK)
+#         batchDf = insertDf.unionByName(updateDf)
+        unionDf = insertDf.unionByName(updateDf).persist(StorageLevel.MEMORY_AND_DISK)
+        batchDf = unionDf.alias('s').join(unionDf.alias('d'), dedupCond, 'left_anti').persist(StorageLevel.MEMORY_AND_DISK)
+        for select in unionSelects:
+          batchDf = batchDf.select(select)
+#         batchDf = batchDf.where('__rn2 = 1').drop('__rn2').persist(StorageLevel.MEMORY_AND_DISK)
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
       if mergeDf is not None:
         mergeDf.unpersist()
         batchDf.unpersist()
+        unionDf.unpersist()
 
     return StreamingJoin(self._left,
                self._right,

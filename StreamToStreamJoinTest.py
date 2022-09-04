@@ -3,6 +3,24 @@
 
 # COMMAND ----------
 
+# MAGIC %sql
+# MAGIC WITH data AS
+# MAGIC (
+# MAGIC SELECT * FROM VALUES(1,2,3)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(1,2,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(2,2,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(null,2,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(null,3,4)
+# MAGIC )
+# MAGIC SELECT * FROM data a
+# MAGIC WHERE NOT EXISTS(SELECT * FROM data where a.col1 is null and col1 is not null and a.col2 = col2 and a.col3 = col3)
+
+# COMMAND ----------
+
 # Enable auto compaction and optimized writes in Delta
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
 spark.conf.set("spark.databricks.delta.autoCompact.enabled","true")
