@@ -152,6 +152,7 @@ class StreamingQuery:
   def start(self):
     if self._dependentQuery is not None:
       self._dependentQuery.start()
+    spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
     return self.stream.start()
 
 class StreamingJoin:
