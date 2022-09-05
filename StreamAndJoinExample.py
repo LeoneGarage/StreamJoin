@@ -199,7 +199,7 @@ j = (
   .onKeys('customer_id')
   .join(c)
   .onKeys('transaction_id')
-  .join(d, 'right')
+  .join(d, 'left')
   .onKeys('order_id')
   .writeToPath(f'{gold_path}/joined')
 #  .foreachBatch(mergeGold)
@@ -231,8 +231,8 @@ bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRe
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
 pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
 aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
-aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id']).drop(oo['transaction_id'])
-cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'right').drop(aa_bb_oo['order_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id']).drop(aa_bb['transaction_id'])
+cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
 cc.count()
 
 # COMMAND ----------
@@ -316,11 +316,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.select(df_cols).where("product_id = '0b25468f-16e3-4079-83fd-62239a118336'"))
+# display(df.select(df_cols).where("product_id = 'e87324a3-1e78-4835-a117-bbb3fc36bb35'"))
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("product_id = '0b25468f-16e3-4079-83fd-62239a118336'"))
+# display(cc.select(cc_cols).where("product_id = 'e87324a3-1e78-4835-a117-bbb3fc36bb35'"))
 
 # COMMAND ----------
 
