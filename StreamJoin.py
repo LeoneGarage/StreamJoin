@@ -338,6 +338,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if self._partitionColumns is not None:
       createSql = f"{createSql} PARTITIONED BY ({', '.join([pc for pc in self._partitionColumns])})"
     spark.sql(createSql)
+
     primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
     sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
     pks = [[], []]
@@ -366,6 +367,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
       outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
+      dedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys]).orderBy([F.desc(f'{pk}') for pk in primaryKeys])
       cond = '__rn = 1 AND ' + cond
       updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableForFunc().toDF().columns}
     else:
@@ -377,8 +379,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
     deltaTableColumns = deltaTableForFunc().toDF().columns
     if outerCond is not None:
       batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in primaryKeys] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
-      dedupCond = F.expr('(' + ' OR '.join([f's.__u_{pk} is null and d.__u_{pk} is not null' for pk in pks[1]]) + ') AND (' + ' AND '.join([f's.__u_{pk} = d.__u_{pk}' for pk in pks[0]]) + ')')
       operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
+      dedupSelect = [F.col('*'), F.row_number().over(dedupWindowSpec).alias('__dedup_rn')]
+      leftNullsCol = F.expr(' + '.join([f'CASE WHEN u.{pk} is not null THEN 0 ELSE 1 END' for pk in primaryKeys]))
+      rightNullsCol = F.expr(' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in primaryKeys]))
+      outerJoinSelect = [F.expr(f'CASE WHEN __left_nulls < __right_nulls THEN u.__u_{c} ELSE staged_updates.__u_{c} END').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __left_nulls < __right_nulls THEN u.{pk} ELSE staged_updates.{pk} END').alias(pk) for pk in primaryKeys] + [F.expr('CASE WHEN __left_nulls < __right_nulls THEN u.__rn ELSE staged_updates.__rn END').alias('__rn')]
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -392,11 +397,12 @@ class StreamToStreamJoinWithConditionForEachBatch:
         u = targetDf.alias('u')
         su = F.broadcast(batchDf).alias('staged_updates')
         mergeDf = u.join(su, outerCond, 'right').select(F.col('*'), operationFlag).select(batchSelect).drop('__operation_flag').persist(StorageLevel.MEMORY_AND_DISK)
-        batchDf = mergeDf.alias('s').join(mergeDf.alias('d'), dedupCond, 'left_anti')#.persist(StorageLevel.MEMORY_AND_DISK)
+        batchDf = mergeDf.alias('u').join(mergeDf.alias('staged_updates'), outerCond).withColumn('__left_nulls', leftNullsCol).withColumn('__right_nulls', rightNullsCol).select(outerJoinSelect)
+        batchDf = batchDf.select(dedupSelect).where('__dedup_rn = 1').drop('__dedup_rn')#.persist(StorageLevel.MEMORY_AND_DISK)
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
       if outerCond is not None:
-        mergeDf.unpersist()
-        batchDf.unpersist()
+         mergeDf.unpersist()
+#         batchDf.unpersist()
 
     return StreamingJoin(self._left,
                self._right,
