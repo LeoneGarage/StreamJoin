@@ -134,12 +134,12 @@ def _dedupBatch(batchDf, windowSpec, primaryKeys):
 # COMMAND ----------
 
 primaryKeys = ['order_id', 'customer_id', 'transaction_id', 'product_id']
-pks = [['order_id'], ['customer_id', 'transaction_id', 'product_id']]
+pks = [['customer_id'], ['customer_id', 'transaction_id', 'order_id', 'product_id']]
 sequenceColumns = ['customer_operation_date', 'operation_date', 'order_operation_date', 'item_operation_date']
 
 # COMMAND ----------
 
-_mergeCondition(['order_id'], ['customer_id', 'transaction_id', 'product_id'])
+_mergeCondition(pks[0], pks[1])
 
 # COMMAND ----------
 
@@ -157,7 +157,7 @@ _mergeCondition(['order_id'], ['customer_id', 'transaction_id', 'product_id'])
 
 # MAGIC %sql
 # MAGIC 
-# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 3 WHERE product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 2 WHERE order_id = 'f2242ba6-9587-47f6-9a9d-61d8f1b5fbd5'
 
 # COMMAND ----------
 
@@ -216,9 +216,9 @@ display(batchDf.where("product_id = '977d1a01-a0f9-4c0e-b17b-79b444311dc4'"))
 
 # MAGIC %sql
 # MAGIC 
-# MAGIC select u.order_id, u.customer_id, u.transaction_id, u.product_id, staged_updates.order_id, staged_updates.customer_id, staged_updates.transaction_id, staged_updates.product_id from delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 3 u
-# MAGIC RIGHT JOIN delta.`/Users/leon.eller@databricks.com/tmp/error/batch0` VERSION AS OF 3 staged_updates ON (u.order_id = staged_updates.order_id AND (u.customer_id is null OR staged_updates.customer_id is null) AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.transaction_id = staged_updates.transaction_id AND (u.customer_id is null OR staged_updates.customer_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.product_id = staged_updates.product_id AND (u.customer_id is null OR staged_updates.customer_id is null) AND (u.transaction_id is null OR staged_updates.transaction_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND u.product_id = staged_updates.product_id AND (u.transaction_id is null OR staged_updates.transaction_id is null)) OR (u.order_id = staged_updates.order_id AND u.transaction_id = staged_updates.transaction_id AND u.product_id = staged_updates.product_id AND (u.customer_id is null OR staged_updates.customer_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.product_id = staged_updates.product_id)
-# MAGIC where u.product_id = '16231085-ae39-46a0-af8e-79ca23d0c5de'
+# MAGIC select u.order_id, u.customer_id, u.transaction_id, u.product_id, staged_updates.order_id, staged_updates.customer_id, staged_updates.transaction_id, staged_updates.product_id from delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 5 u
+# MAGIC RIGHT JOIN delta.`/Users/leon.eller@databricks.com/tmp/error/batch0` VERSION AS OF 5 staged_updates ON (u.customer_id = staged_updates.customer_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.order_id is null OR staged_updates.order_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.order_id is null OR staged_updates.order_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND (u.order_id is null OR staged_updates.order_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.order_id = staged_updates.order_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.product_id = staged_updates.product_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.order_id is null OR staged_updates.order_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND (u.order_id is null OR staged_updates.order_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.order_id = staged_updates.order_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.product_id = staged_updates.product_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.order_id is null OR staged_updates.order_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.order_id = staged_updates.order_id AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.product_id = staged_updates.product_id AND (u.order_id is null OR staged_updates.order_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.order_id = staged_updates.order_id AND u.product_id = staged_updates.product_id AND (u.transaction_id is null OR staged_updates.transaction_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.order_id = staged_updates.order_id AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.product_id = staged_updates.product_id AND (u.order_id is null OR staged_updates.order_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.order_id = staged_updates.order_id AND u.product_id = staged_updates.product_id AND (u.transaction_id is null OR staged_updates.transaction_id is null)) OR (u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.order_id = staged_updates.order_id AND u.product_id = staged_updates.product_id) OR (u.customer_id = staged_updates.customer_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.order_id = staged_updates.order_id AND u.product_id = staged_updates.product_id)
+# MAGIC where staged_updates.order_id = 'f2242ba6-9587-47f6-9a9d-61d8f1b5fbd5'
 
 # COMMAND ----------
 
@@ -230,13 +230,13 @@ display(batchDf.where("product_id = '977d1a01-a0f9-4c0e-b17b-79b444311dc4'"))
 
 # MAGIC %sql
 # MAGIC 
-# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/merge` VERSION AS OF 3 where product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/merge` VERSION AS OF 5 where __u_order_id = 'f2242ba6-9587-47f6-9a9d-61d8f1b5fbd5'
 
 # COMMAND ----------
 
 # MAGIC %sql
 # MAGIC 
-# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/batch1` VERSION AS OF 3 where product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/batch1` VERSION AS OF 5 --where __u_order_id = 'f2242ba6-9587-47f6-9a9d-61d8f1b5fbd5'
 
 # COMMAND ----------
 
