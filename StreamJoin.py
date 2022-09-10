@@ -31,6 +31,178 @@ pyspark.sql.types.StructType.fromDDL = _parse_datatype_string
 
 # COMMAND ----------
 
+class StreamToStreamJoin:
+  _left = None
+  _right = None
+  _joinType = None
+  _dependentQuery = None
+  _upstreamJoinCond = None
+
+  def __init__(self,
+               left,
+               right,
+               joinType):
+    self._left = left
+    self._right = right
+    self._joinType = joinType
+  
+  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
+    self._dependentQuery = dependentQuery
+    self._upstreamJoinCond = upstreamJoinCond
+    return self
+
+  def stagingPath(self):
+    return StreamToStreamJoinWithCondition(self._left,
+               self._right,
+               self._joinType,
+               [],
+               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond).stagingPath()
+
+  def on(self,
+           joinExpr):
+    return StreamToStreamJoinWithCondition(self._left,
+               self._right,
+               self._joinType,
+               joinExpr,
+               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
+ 
+  def onKeys(self, *keys):
+    joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
+    return StreamToStreamJoinWithCondition(self._left,
+               self._right,
+               self._joinType,
+               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)._onKeys(keys)
+
+# COMMAND ----------
+
+class ColumnSelector:
+  _stream = None
+  _columnName = None
+  _func = None
+
+  def __init__(self,
+               stream,
+               columnName):
+    self._stream = stream
+    self._columnName = columnName
+
+  def stream(self):
+    return self._stream.stream()
+
+  def columnName(self):
+    return self._columnName
+  
+  def transform(self, col):
+    if self._func is None:
+      return col
+    return self._func(col)
+
+  def to(self, func):
+    self._func = func
+    return self
+
+# COMMAND ----------
+
+class Stream:
+  _stream = None
+  _staticReader = None
+  _static = None
+  _primaryKeys = None
+  _sequenceColumns = None
+  _path = None
+  _name = None
+  excludedColumns = ['_commit_version']
+
+  def __init__(self,
+               stream,
+               staticReader):
+    self._stream = stream
+    self._staticReader = staticReader
+  
+  @staticmethod
+  def readAtVersion(reader, version = None):
+    if version is not None:
+      loader = reader.option('versionAsOf', version)
+    else:
+      loader = reader
+    return loader
+    
+  @staticmethod
+  def fromPath(path, startingVersion = None):
+    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
+    if startingVersion is not None:
+      cdfStream.option("startingVersion", "{startingVersion}")
+    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
+    reader = spark.read.format('delta')
+    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).load(path)).setPath(path)
+
+  @staticmethod
+  def fromTable(tableName, startingVersion = None):
+    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
+    if startingVersion is not None:
+      cdfStream.option("startingVersion", "{startingVersion}")
+    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
+    reader = spark.read.format('delta')
+    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).table(tableName)).setName(tableName).setPath(tableName)
+
+  def __getitem__(self, key):
+    return ColumnSelector(self, key)
+  
+  def setName(self, name):
+    self._name = name
+    return self
+
+  def name(self):
+    if self._name is None or len(self._name) == 0:
+      self._name = os.path.basename(self.path())
+    return self._name
+
+  def setPath(self, path):
+    self._path = path
+    return self
+  
+  def path(self):
+    return self._path
+
+  def columns(self):
+    return [c for c in self._stream.columns if c not in Stream.excludedColumns]
+
+  def stream(self):
+    return self._stream
+
+  def static(self, version = None):
+    if version is None:
+      if self._static is None:
+        self._static = self._staticReader(version)
+      return self._static
+    return self._staticReader(version)
+
+  def primaryKeys(self, *keys):
+    self._primaryKeys = keys
+    return self
+  
+  def getPrimaryKeys(self):
+    return self._primaryKeys
+
+  def sequenceBy(self, *columns):
+    self._sequenceColumns = columns
+    return self
+  
+  def getSequenceColumns(self):
+    return self._sequenceColumns
+
+  def join(self, right, joinType = 'inner'):
+    return StreamToStreamJoin(self, right, joinType)
+  
+  def to(self, func):
+    self._stream = func(self._stream)
+#     self._static = func(self._static)
+    reader = self._staticReader
+    self._staticReader = lambda v: func(reader(v))
+    return self
+
+# COMMAND ----------
+
 class MicrobatchJoin:
   _leftMicrobatch = None
   _leftStatic = None
@@ -384,13 +556,13 @@ class StreamToStreamJoinWithConditionForEachBatch:
       outerCond = F.expr(outerCondStr)
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
-      outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc('staged_updates._commit_version')] + [f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
+      outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns] + [F.expr('(' + ' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]) + ')')])
       dedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys]).orderBy([F.desc(f'{pk}') for pk in primaryKeys])
       cond = '__rn = 1 AND ' + cond
       updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableForFunc().toDF().columns}
     else:
       updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
-    windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc('_commit_version')])
+    windowSpec = None
     if sequenceColumns is not None and len(sequenceColumns) > 0:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc('_commit_version')] + [F.desc(sc) for sc in sequenceColumns])
       matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{"__u_" if len(pks[1]) > 0 else ""}{sc})' for sc in sequenceColumns])
@@ -475,32 +647,6 @@ class StreamToStreamJoinWithConditionForEachBatch:
 
   def writeToTable(self, tableName):
     return self._writeToTarget(lambda: DeltaTable.forName(spark, tableName), tableName, None)
-      
-class ColumnSelector:
-  _stream = None
-  _columnName = None
-  _func = None
-
-  def __init__(self,
-               stream,
-               columnName):
-    self._stream = stream
-    self._columnName = columnName
-
-  def stream(self):
-    return self._stream.stream()
-
-  def columnName(self):
-    return self._columnName
-  
-  def transform(self, col):
-    if self._func is None:
-      return col
-    return self._func(col)
-
-  def to(self, func):
-    self._func = func
-    return self
     
 class StreamToStreamJoinWithCondition:
   _left = None
@@ -620,143 +766,3 @@ class StreamToStreamJoinWithCondition:
                self._partitionColumns,
                selectFunc,
                finalSelectFunc)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
-
-class StreamToStreamJoin:
-  _left = None
-  _right = None
-  _joinType = None
-  _dependentQuery = None
-  _upstreamJoinCond = None
-
-  def __init__(self,
-               left,
-               right,
-               joinType):
-    self._left = left
-    self._right = right
-    self._joinType = joinType
-  
-  def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
-    self._dependentQuery = dependentQuery
-    self._upstreamJoinCond = upstreamJoinCond
-    return self
-
-  def stagingPath(self):
-    return StreamToStreamJoinWithCondition(self._left,
-               self._right,
-               self._joinType,
-               [],
-               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond).stagingPath()
-
-  def on(self,
-           joinExpr):
-    return StreamToStreamJoinWithCondition(self._left,
-               self._right,
-               self._joinType,
-               joinExpr,
-               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
- 
-  def onKeys(self, *keys):
-    joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
-    return StreamToStreamJoinWithCondition(self._left,
-               self._right,
-               self._joinType,
-               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)._onKeys(keys)
-
-class Stream:
-  _stream = None
-  _staticReader = None
-  _static = None
-  _primaryKeys = None
-  _sequenceColumns = None
-  _path = None
-  _name = None
-  excludedColumns = ['_commit_version']
-
-  def __init__(self,
-               stream,
-               staticReader):
-    self._stream = stream
-    self._staticReader = staticReader
-  
-  @staticmethod
-  def readAtVersion(reader, version = None):
-    if version is not None:
-      loader = reader.option('versionAsOf', version)
-    else:
-      loader = reader
-    return loader
-    
-  @staticmethod
-  def fromPath(path, startingVersion = None):
-    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
-    if startingVersion is not None:
-      cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
-    reader = spark.read.format('delta')
-    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).load(path)).setPath(path)
-
-  @staticmethod
-  def fromTable(tableName, startingVersion = None):
-    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
-    if startingVersion is not None:
-      cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
-    reader = spark.read.format('delta')
-    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).table(tableName)).setName(tableName).setPath(tableName)
-
-  def __getitem__(self, key):
-    return ColumnSelector(self, key)
-  
-  def setName(self, name):
-    self._name = name
-    return self
-
-  def name(self):
-    if self._name is None or len(self._name) == 0:
-      self._name = os.path.basename(self.path())
-    return self._name
-
-  def setPath(self, path):
-    self._path = path
-    return self
-  
-  def path(self):
-    return self._path
-
-  def columns(self):
-    return [c for c in self._stream.columns if c not in Stream.excludedColumns]
-
-  def stream(self):
-    return self._stream
-
-  def static(self, version = None):
-    if version is None:
-      if self._static is None:
-        self._static = self._staticReader(version)
-      return self._static
-    return self._staticReader(version)
-
-  def primaryKeys(self, *keys):
-    self._primaryKeys = keys
-    return self
-  
-  def getPrimaryKeys(self):
-    return self._primaryKeys
-
-  def sequenceBy(self, *columns):
-    self._sequenceColumns = columns
-    return self
-  
-  def getSequenceColumns(self):
-    return self._sequenceColumns
-
-  def join(self, right, joinType = 'inner'):
-    return StreamToStreamJoin(self, right, joinType)
-  
-  def to(self, func):
-    self._stream = func(self._stream)
-#     self._static = func(self._static)
-    reader = self._staticReader
-    self._staticReader = lambda v: func(reader(v))
-    return self
