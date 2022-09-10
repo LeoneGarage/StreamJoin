@@ -413,7 +413,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
         su = F.broadcast(batchDf).alias('staged_updates')
-        mergeDf = u.join(su, outerCond, 'right').select(F.col('*'), operationFlag).select(batchSelect + [F.col('_commit_version')]).drop('__operation_flag').select(F.col('*'),
+        mergeDf = u.join(su, outerCond, 'right').select(F.col('*'), operationFlag).select(batchSelect).drop('__operation_flag').select(F.col('*'),
                                                                                                                                        nullsCol.alias('__pk_nulls_count'),
                                                                                                                                        stagedNullsCol.alias('__u_pk_nulls_count'))
         mergeDf = mergeDf.persist(StorageLevel.MEMORY_AND_DISK)
