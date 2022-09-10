@@ -564,7 +564,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
       updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
     windowSpec = None
     if sequenceColumns is not None and len(sequenceColumns) > 0:
-      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc('_commit_version')] + [F.desc(sc) for sc in sequenceColumns])
+      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
       matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{"__u_" if len(pks[1]) > 0 else ""}{sc})' for sc in sequenceColumns])
     deltaTableColumns = deltaTableForFunc().toDF().columns
     if outerCond is not None:
@@ -572,7 +572,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
       operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
       nullsCol = F.expr(' + '.join([f'CASE WHEN {pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
       stagedNullsCol = F.expr(' + '.join([f'CASE WHEN __u_{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
-      antiJoinCond = F.expr(' AND '.join([f'({outerCondStr})', '((u.__rn != 1 AND (u.__pk_nulls_count > staged_updates.__pk_nulls_count OR u.__u_pk_nulls_count > staged_updates.__u_pk_nulls_count)))']))
+      antiJoinCond = F.expr(' AND '.join([f'({outerCondStr})', '((u.__rn != 1 AND (u.__pk_nulls_count > staged_updates.__pk_nulls_count OR u.__u_pk_nulls_count > staged_updates.__u_pk_nulls_count)))', ' AND '.join([f'(u.__u_{pk} <=> staged_updates.__u_{pk} OR u.__u_{pk} is null)' for pk in pks[1]])]))
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -582,6 +582,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
         batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
       else:
         batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
+#         if 'product_id' in deltaTableColumns:
+#           batchDf.withColumnRenamed('_commit_version', '__commit_version').write.format('delta').mode('overwrite').save('/Users/leon.eller@databricks.com/tmp/error/batch0')
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
         su = F.broadcast(batchDf).alias('staged_updates')
@@ -589,7 +591,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
                                                                                                                                        nullsCol.alias('__pk_nulls_count'),
                                                                                                                                        stagedNullsCol.alias('__u_pk_nulls_count'))
         mergeDf = mergeDf.persist(StorageLevel.MEMORY_AND_DISK)
+#         if 'product_id' in deltaTableColumns:
+#           mergeDf.withColumnRenamed('_commit_version', '__commit_version').write.format('delta').mode('overwrite').save('/Users/leon.eller@databricks.com/tmp/error/merge')
         batchDf = mergeDf.alias('u').join(mergeDf.alias('staged_updates'), antiJoinCond, 'left_anti')
+#         if 'product_id' in deltaTableColumns:
+#           batchDf.withColumnRenamed('_commit_version', '__commit_version').write.format('delta').mode('overwrite').save('/Users/leon.eller@databricks.com/tmp/error/batch1')
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
       if mergeDf is not None:
          mergeDf.unpersist()
