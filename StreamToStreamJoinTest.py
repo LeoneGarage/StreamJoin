@@ -105,8 +105,143 @@ d = (
 
 # COMMAND ----------
 
+def _mergeCondition(nonNullableKeys, nullableKeys, extraCond = ''):
+  arr = []
+  for i in range(0, len(nullableKeys)+1):
+    nullKeys = nullableKeys.copy()
+    t = list(itertools.combinations(nullKeys, i))
+    for ii in range(0, len(t)):
+      item = nonNullableKeys.copy()
+      out = [f'u.{pk} = staged_updates.{pk}' for pk in item]
+      for iii in range(0, len(t[ii])):
+        item += [t[ii][iii]]
+        out += [f'u.{t[ii][iii]} = staged_updates.{t[ii][iii]}']
+      hasNullable = False
+      for pk in nullKeys:
+        if pk not in item:
+          out += [f'(u.{pk} is null OR staged_updates.{pk} is null)']
+          hasNullable = True
+      arr += [f"({' AND '.join(out)}{extraCond if len(nullableKeys) > 0 else ''})"]
+  return ' OR '.join(arr)
+
+def _dedupBatch(batchDf, windowSpec, primaryKeys):
+    if windowSpec is not None:
+      batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
+    else:
+      batchDf = batchDf.dropDuplicates(primaryKeys)
+    return batchDf
+
+# COMMAND ----------
+
+primaryKeys = ['order_id', 'customer_id', 'transaction_id', 'product_id']
+pks = [['order_id'], ['customer_id', 'transaction_id', 'product_id']]
+sequenceColumns = ['customer_operation_date', 'operation_date', 'order_operation_date', 'item_operation_date']
+
+# COMMAND ----------
+
+_mergeCondition(['order_id'], ['customer_id', 'transaction_id', 'product_id'])
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC DESCRIBE history delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined`
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC DESCRIBE history delta.`/Users/leon.eller@databricks.com/tmp/error/batch0`
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 3 WHERE product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+
+# COMMAND ----------
+
+deltaDF = spark.read.format('delta').option('versionAsOf', 1).load('/Users/leon.eller@databricks.com/tmp/demo/gold/joined')
+
+# COMMAND ----------
+
+cond = ' AND '.join([f'u.{pk} = staged_updates.{pk}' for pk in pks[0]] + [f'u.{pk} <=> staged_updates.{pk}' for pk in pks[1]])
+if len(pks[1]) > 0:
+  outerCondStr = _mergeCondition(pks[0], pks[1])
+  outerCond = F.expr(outerCondStr)
+  insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
+  updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
+  outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
+  dedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys]).orderBy([F.desc(f'{pk}') for pk in primaryKeys])
+  cond = '__rn = 1 AND ' + cond
+  updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaDF.columns}
+else:
+  updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaDF.columns}
+
+windowSpec = None
+if sequenceColumns is not None and len(sequenceColumns) > 0:
+  windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
+  matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{"__u_" if len(pks[1]) > 0 else ""}{sc})' for sc in sequenceColumns])
+deltaTableColumns = deltaDF.columns
+if outerCond is not None:
+  batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in primaryKeys] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
+  operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
+  nullsCol = F.expr(' + '.join([f'CASE WHEN {pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
+  stagedNullsCol = F.expr(' + '.join([f'CASE WHEN __u_{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
+  antiJoinCond = F.expr(' AND '.join([f'({outerCondStr})', '((u.__rn != 1 AND (u.__pk_nulls_count > staged_updates.__pk_nulls_count OR u.__u_pk_nulls_count > staged_updates.__u_pk_nulls_count)))']))
+
+# COMMAND ----------
+
+batchDf = spark.read.format('delta').option('versionAsOf', 1).load('/Users/leon.eller@databricks.com/tmp/error/batch0')
+targetDf = deltaDF
+u = targetDf.alias('u')
+su = F.broadcast(batchDf).alias('staged_updates')
+mergeDf = u.join(su, outerCond, 'right').select(F.col('*'), operationFlag).select(batchSelect).drop('__operation_flag').select(F.col('*'),
+                                                                                                                               nullsCol.alias('__pk_nulls_count'),
+                                                                                                                               stagedNullsCol.alias('__u_pk_nulls_count'))
+
+# COMMAND ----------
+
+display(mergeDf.where("product_id = '977d1a01-a0f9-4c0e-b17b-79b444311dc4'"))
+
+# COMMAND ----------
+
+batchDf = mergeDf.alias('u').join(mergeDf.alias('staged_updates'), antiJoinCond, 'left_anti')
+
+# COMMAND ----------
+
+display(batchDf.where("product_id = '977d1a01-a0f9-4c0e-b17b-79b444311dc4'"))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC select u.order_id, u.customer_id, u.transaction_id, u.product_id, staged_updates.order_id, staged_updates.customer_id, staged_updates.transaction_id, staged_updates.product_id from delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 3 u
+# MAGIC RIGHT JOIN delta.`/Users/leon.eller@databricks.com/tmp/error/batch0` VERSION AS OF 3 staged_updates ON (u.order_id = staged_updates.order_id AND (u.customer_id is null OR staged_updates.customer_id is null) AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND (u.transaction_id is null OR staged_updates.transaction_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.transaction_id = staged_updates.transaction_id AND (u.customer_id is null OR staged_updates.customer_id is null) AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.product_id = staged_updates.product_id AND (u.customer_id is null OR staged_updates.customer_id is null) AND (u.transaction_id is null OR staged_updates.transaction_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND (u.product_id is null OR staged_updates.product_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND u.product_id = staged_updates.product_id AND (u.transaction_id is null OR staged_updates.transaction_id is null)) OR (u.order_id = staged_updates.order_id AND u.transaction_id = staged_updates.transaction_id AND u.product_id = staged_updates.product_id AND (u.customer_id is null OR staged_updates.customer_id is null)) OR (u.order_id = staged_updates.order_id AND u.customer_id = staged_updates.customer_id AND u.transaction_id = staged_updates.transaction_id AND u.product_id = staged_updates.product_id)
+# MAGIC where u.product_id = '16231085-ae39-46a0-af8e-79ca23d0c5de'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` VERSION AS OF 3 where product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/merge` VERSION AS OF 3 where product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/batch1` VERSION AS OF 3 where product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'
+
+# COMMAND ----------
+
 # batch0 = spark.read.format('delta').load('/Users/leon.eller@databricks.com/tmp/error/batch0')
-batch = spark.read.format('delta').load('/Users/leon.eller@databricks.com/tmp/error/batch')
+batch2 = spark.read.format('delta').load('/Users/leon.eller@databricks.com/tmp/error/batch2')
 
 # COMMAND ----------
 

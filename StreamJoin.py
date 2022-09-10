@@ -69,20 +69,20 @@ class MicrobatchJoin:
            finalSelectCols):
     if isinstance(selectCols, tuple) or isinstance(selectCols, str):
       dropDupKeys = MicrobatchJoin._dropDupKeys
-      selectFunc = lambda f, l, r: f.selectExpr(*selectCols)
-      finalSelectFunc = lambda f, l, r: f.selectExpr(*selectCols)
+      selectFunc = lambda f, l, r, extraCols: f.selectExpr(*selectCols, *extraCols)
+      finalSelectFunc = lambda f, l, r, extraCols: f.selectExpr(*selectCols, *extraCols)
     else:
       dropDupKeys = lambda pk, f, r: f
-      selectFunc = lambda f, l, r: f.select(*selectCols(l, r))
-      finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(l, r))
+      selectFunc = lambda f, l, r, extraCols: f.select(*selectCols(l, r), *extraCols)
+      finalSelectFunc = lambda f, l, r, extraCols: f.select(*finalSelectCols(l, r), *extraCols)
 
     newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
     newLeft = dropDupKeys(joinKeyColumnNames, newLeft, self._rightStatic if joinType == 'inner' or joinType == 'left' else self._leftMicrobatch)
-    newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic)
+    newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic, [self._leftMicrobatch[c].alias(c) for c in Stream.excludedColumns])
 
     newRight = F.broadcast(self._rightMicrobatch).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
     newRight = dropDupKeys(joinKeyColumnNames, newRight, self._rightMicrobatch if joinType == 'inner' or joinType == 'left' else self._leftStatic)
-    newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
+    newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch, [self._rightMicrobatch[c].alias(c) for c in Stream.excludedColumns])
 
     primaryKeys = list(dict.fromkeys(self._leftPrimaryKeys + self._rightPrimaryKeys))
     primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k] == newRight[k] for k in primaryKeys])
@@ -102,10 +102,11 @@ class MicrobatchJoin:
       raise Exception(f'{joinType} join type is not supported')
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNotNull() & newRight[pk].isNotNull() for pk in joinKeyColumnNames]))
     both = dropDupKeys(joinKeyColumnNames, both, newLeft)
-    both = selectFunc(both, newLeft, newRight)
+    both = selectFunc(both, newLeft, newRight, [F.greatest(newLeft[c], newRight[c]).alias(c) for c in Stream.excludedColumns])
     unionDf = left.unionByName(right).unionByName(both)
     unionDf = unionDf.where(reduce(lambda e, pk: e | pk, [unionDf[pk].isNotNull() for pk in primaryKeys]))
-    finalDf = finalSelectFunc(unionDf, unionDf, unionDf).persist(StorageLevel.MEMORY_AND_DISK)
+    finalDf = finalSelectFunc(unionDf, unionDf, unionDf, [unionDf[c] for c in Stream.excludedColumns])
+    finalDf = finalDf.persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(finalDf)
     return finalDf
   
@@ -189,7 +190,23 @@ class StreamingJoin:
     def _mergeJoin(batchDf, batchId):
       left = batchDf.where('left is not null').select('left.*')
       right = batchDf.where('right is not null').select('right.*')
-      with MicrobatchJoin(left, leftStatic, self._left.getPrimaryKeys(), right, rightStatic, self._right.getPrimaryKeys()) as mj:
+      maxCommitVersions = (
+                                left.agg(F.max('_commit_version').alias('_left_commit_version'), F.lit(None).alias('_right_commit_version'))
+                                    .unionByName(right.agg(F.lit(None).alias('_left_commit_version'), F.max('_commit_version').alias('_right_commit_version')))
+                                    .agg(F.sum('_left_commit_version').alias('_left_commit_version'), F.sum('_right_commit_version').alias('_right_commit_version'))
+                                    .collect()[0]
+                             )
+      # We want to grab the max commit version in the microbatch so we do a consistent read of left and right static pinned at that version
+      # otherwise the read may be non-deterministic due to lazy spark evaluation
+      leftMaxCommitVersion = maxCommitVersions[0]
+      rightMaxCommitVersion = maxCommitVersions[1]
+      leftStaticLocal = leftStatic
+      rightStaticLocal = rightStatic
+      if leftMaxCommitVersion is not None:
+        leftStaticLocal = self._left.static(leftMaxCommitVersion)
+      if rightMaxCommitVersion is not None:
+        rightStaticLocal = self._right.static(rightMaxCommitVersion)
+      with MicrobatchJoin(left, leftStaticLocal, self._left.getPrimaryKeys(), right, rightStaticLocal, self._right.getPrimaryKeys()) as mj:
         joinedBatchDf = mj.join(self._joinType,
                                 joinExpr,
                                 joinKeyColumnNames,
@@ -307,7 +324,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
         hasNullable = False
         for pk in nullKeys:
           if pk not in item:
-            out += [f'u.{pk} is null']
+            out += [f'(u.{pk} is null OR staged_updates.{pk} is null)']
             hasNullable = True
         arr += [f"({' AND '.join(out)}{extraCond if len(nullableKeys) > 0 else ''})"]
     return ' OR '.join(arr)
@@ -363,27 +380,27 @@ class StreamToStreamJoinWithConditionForEachBatch:
     insertFilter = None
     updateFilter = None
     if len(pks[1]) > 0:
-      outerCond = F.expr(self._mergeCondition(pks[0], pks[1]))
+      outerCondStr = self._mergeCondition(pks[0], pks[1])
+      outerCond = F.expr(outerCondStr)
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
-      outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
+      outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc('staged_updates._commit_version')] + [f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns])
       dedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys]).orderBy([F.desc(f'{pk}') for pk in primaryKeys])
       cond = '__rn = 1 AND ' + cond
       updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableForFunc().toDF().columns}
     else:
       updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
-    windowSpec = None
-    if primaryKeys is not None and len(primaryKeys) > 0 and sequenceColumns is not None and len(sequenceColumns) > 0:
-      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
+    windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc('_commit_version')])
+    if sequenceColumns is not None and len(sequenceColumns) > 0:
+      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc('_commit_version')] + [F.desc(sc) for sc in sequenceColumns])
       matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{"__u_" if len(pks[1]) > 0 else ""}{sc})' for sc in sequenceColumns])
     deltaTableColumns = deltaTableForFunc().toDF().columns
     if outerCond is not None:
       batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in primaryKeys] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
       operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
-      dedupSelect = [F.col('*'), F.row_number().over(dedupWindowSpec).alias('__dedup_rn')]
-      leftNullsCol = F.expr(' + '.join([f'CASE WHEN u.{pk} is not null THEN 0 ELSE 1 END' for pk in primaryKeys]))
-      rightNullsCol = F.expr(' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in primaryKeys]))
-      outerJoinSelect = [F.expr(f'CASE WHEN __left_nulls < __right_nulls THEN u.__u_{c} ELSE staged_updates.__u_{c} END').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __left_nulls < __right_nulls THEN u.{pk} ELSE staged_updates.{pk} END').alias(pk) for pk in primaryKeys] + [F.expr('CASE WHEN __left_nulls < __right_nulls THEN u.__rn ELSE staged_updates.__rn END').alias('__rn')]
+      nullsCol = F.expr(' + '.join([f'CASE WHEN {pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
+      stagedNullsCol = F.expr(' + '.join([f'CASE WHEN __u_{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
+      antiJoinCond = F.expr(' AND '.join([f'({outerCondStr})', '((u.__rn != 1 AND (u.__pk_nulls_count > staged_updates.__pk_nulls_count OR u.__u_pk_nulls_count > staged_updates.__u_pk_nulls_count)))']))
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -396,13 +413,14 @@ class StreamToStreamJoinWithConditionForEachBatch:
         targetDf = deltaTable.toDF()
         u = targetDf.alias('u')
         su = F.broadcast(batchDf).alias('staged_updates')
-        mergeDf = u.join(su, outerCond, 'right').select(F.col('*'), operationFlag).select(batchSelect).drop('__operation_flag').persist(StorageLevel.MEMORY_AND_DISK)
-        batchDf = mergeDf.alias('u').join(mergeDf.alias('staged_updates'), outerCond).withColumn('__left_nulls', leftNullsCol).withColumn('__right_nulls', rightNullsCol).select(outerJoinSelect)
-        batchDf = batchDf.select(dedupSelect).where('__dedup_rn = 1').drop('__dedup_rn')#.persist(StorageLevel.MEMORY_AND_DISK)
+        mergeDf = u.join(su, outerCond, 'right').select(F.col('*'), operationFlag).select(batchSelect + [F.col('_commit_version')]).drop('__operation_flag').select(F.col('*'),
+                                                                                                                                       nullsCol.alias('__pk_nulls_count'),
+                                                                                                                                       stagedNullsCol.alias('__u_pk_nulls_count'))
+        mergeDf = mergeDf.persist(StorageLevel.MEMORY_AND_DISK)
+        batchDf = mergeDf.alias('u').join(mergeDf.alias('staged_updates'), antiJoinCond, 'left_anti')
       self._doMerge(deltaTable, cond, primaryKeys, windowSpec, updateCols, matchCondition, batchDf, batchId)
-      if outerCond is not None:
+      if mergeDf is not None:
          mergeDf.unpersist()
-#         batchDf.unpersist()
 
     return StreamingJoin(self._left,
                self._right,
@@ -536,6 +554,9 @@ class StreamToStreamJoinWithCondition:
   def join(self, right, joinType = 'inner', stagingPath = None):
     return self.select('*').join(right, joinType, stagingPath)
 
+  def foreachBatch(self, mergeFunc):
+    return self.select('*').foreachBatch(mergeFunc)
+
   def writeToPath(self, path):
     return self.select('*').writeToPath(path)
 
@@ -549,10 +570,10 @@ class StreamToStreamJoinWithCondition:
       for c in selectCols:
         if c.columnName() == '*':
           if c.stream() is self._left.stream():
-            for col in self._left.stream().columns:
+            for col in self._left.columns():
               expandedCols.append(ColumnSelector(self._left, col))
           elif c.stream() is self._right.stream():
-            for col in self._right.stream().columns:
+            for col in self._right.columns():
               expandedCols.append(ColumnSelector(self._right, col))
         else:
           expandedCols.append(c)
@@ -579,15 +600,15 @@ class StreamToStreamJoinWithCondition:
     else:
       if isinstance(selectCols, tuple):
         # if '*' is specified convert to columns from left and right minus primary keys on right to avoid dups
-        leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.stream().columns] for c in selectCols if c == '*']
-        rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.stream().columns] for c in selectCols if c == '*']
+        leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.columns()] for c in selectCols if c == '*']
+        rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.columns()] for c in selectCols if c == '*']
         leftCols = [lc for arr in leftStars for lc in arr]
         rightCols = [lc for arr in rightStars for lc in arr if lc.columnName() not in self._joinKeys]
         allCols = leftCols + rightCols
         if len(allCols) > 0:
           return self.select(*allCols)
         else:
-          return self.select(*([ColumnSelector(self._left, lc) for lc in self._left.stream().columns if lc in selectCols] + [ColumnSelector(self._right, lc) for lc in self._right.stream().columns if lc in selectCols]))
+          return self.select(*([ColumnSelector(self._left, lc) for lc in self._left.columns() if lc in selectCols] + [ColumnSelector(self._right, lc) for lc in self._right.columns() if lc in selectCols]))
       else:
         selectFunc = selectCols
         finalSelectFunc = selectFunc
@@ -644,33 +665,45 @@ class StreamToStreamJoin:
 
 class Stream:
   _stream = None
+  _staticReader = None
   _static = None
   _primaryKeys = None
   _sequenceColumns = None
   _path = None
   _name = None
+  excludedColumns = ['_commit_version']
 
   def __init__(self,
                stream,
-               static):
+               staticReader):
     self._stream = stream
-    self._static = static
+    self._staticReader = staticReader
   
+  @staticmethod
+  def readAtVersion(reader, version = None):
+    if version is not None:
+      loader = reader.option('versionAsOf', version)
+    else:
+      loader = reader
+    return loader
+    
   @staticmethod
   def fromPath(path, startingVersion = None):
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_version', '_commit_timestamp')
-    return Stream(cdfStream, spark.read.format('delta').load(path)).setPath(path)
+    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
+    reader = spark.read.format('delta')
+    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).load(path)).setPath(path)
 
   @staticmethod
   def fromTable(tableName, startingVersion = None):
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_version', '_commit_timestamp')
-    return Stream(cdfStream, spark.read.format('delta').table(tableName)).setName(tableName).setPath(tableName)
+    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
+    reader = spark.read.format('delta')
+    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).table(tableName)).setName(tableName).setPath(tableName)
 
   def __getitem__(self, key):
     return ColumnSelector(self, key)
@@ -691,10 +724,18 @@ class Stream:
   def path(self):
     return self._path
 
+  def columns(self):
+    return [c for c in self._stream.columns if c not in Stream.excludedColumns]
+
   def stream(self):
     return self._stream
-  def static(self):
-    return self._static
+
+  def static(self, version = None):
+    if version is None:
+      if self._static is None:
+        self._static = self._staticReader(version)
+      return self._static
+    return self._staticReader(version)
 
   def primaryKeys(self, *keys):
     self._primaryKeys = keys
@@ -715,5 +756,7 @@ class Stream:
   
   def to(self, func):
     self._stream = func(self._stream)
-    self._static = func(self._static)
+#     self._static = func(self._static)
+    reader = self._staticReader
+    self._staticReader = lambda v: func(reader(v))
     return self

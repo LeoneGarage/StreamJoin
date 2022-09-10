@@ -34,6 +34,10 @@ dbutils.fs.rm(gold_path, True)
 
 # COMMAND ----------
 
+dbutils.fs.rm(f'/Users/{user}/tmp/error', True)
+
+# COMMAND ----------
+
 spark.sql(f'''
 CREATE TABLE delta.`{silver_path}/transactions` ( amount STRING, customer_id STRING, id STRING, item_count STRING, operation STRING, operation_date STRING, transaction_date STRING) USING delta 
 ''')
@@ -197,7 +201,7 @@ d = (
 j = (
   a.join(b, 'right')
   .onKeys('customer_id')
-  .join(c, 'left')
+  .join(c, 'right')
   .onKeys('transaction_id')
   .join(d, 'left')
   .onKeys('order_id')
@@ -207,6 +211,27 @@ j = (
   .queryName('gold')
   .start()
 )
+
+# COMMAND ----------
+
+# def test(batchDf, batchId):
+#   count = 30
+#   snapshotMax = batchDf.agg(F.max('_commit_version').alias('_commit_version')).collect()[0][0]
+#   while(count > 0):
+#     max = batchDf.agg(F.max('_commit_version').alias('_commit_version')).collect()[0][0]
+#     print(f'********* batchId = {batchId}, max = {max}')
+#     if max != snapshotMax:
+#       raise Exception(f'{max} != {snapshotMax}')
+#     count -= 1
+
+# j = (
+#   a.join(b, 'right')
+#   .onKeys('customer_id')
+#   .foreachBatch(test)
+#   .option("checkpointLocation", f'{checkpointLocation}/gold/joined')
+#   .queryName('gold')
+#   .start()
+# )
 
 # COMMAND ----------
 
@@ -231,7 +256,7 @@ bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRe
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
 pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
 aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
-aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'left').drop(oo['transaction_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
 cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
 cc.count()
 
@@ -261,6 +286,10 @@ cc_cols.sort()
 
 print(df.select(df_cols).exceptAll(cc.select(cc_cols)).count())
 print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
+
+# COMMAND ----------
+
+# display(DeltaTable.forPath(spark, f'{gold_path}/joined').history())
 
 # COMMAND ----------
 
@@ -316,11 +345,16 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-display(df.select(df_cols).where("product_id = '5a82ade0-06d7-4bb9-b5f7-f79c3fe7b122'"))
+# df = spark.read.format('delta').option('versionAsOf', 10).load(f'{gold_path}/joined')
+# display(df.select(df_cols).where("product_id = '6a7ba336-932e-4024-99ae-75f3c99acd47'"))
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("product_id = 'e87324a3-1e78-4835-a117-bbb3fc36bb35'"))
+# display(df.select(df_cols).where("product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).where("product_id = '6a7ba336-932e-4024-99ae-75f3c99acd47'"))
 
 # COMMAND ----------
 
