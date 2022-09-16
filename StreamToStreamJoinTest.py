@@ -6,6 +6,103 @@
 # MAGIC %sql
 # MAGIC WITH data AS
 # MAGIC (
+# MAGIC SELECT * FROM VALUES(1,2,3,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(1,2,3,5)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(1,null,3,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(1,null,3,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(1,3,3,null)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(1,null,3,null)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(null,null,3,null)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(2,2,3,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(2,2,3,null)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(2,4,6,4)
+# MAGIC UNION ALL
+# MAGIC SELECT * FROM VALUES(2,5,6,4)
+# MAGIC )
+# MAGIC SELECT customer_id, transaction_id, order_id, product_id, ROW_NUMBER() over(partition by order_id, count order by customer_id desc, transaction_id desc, product_id desc) as rn
+# MAGIC FROM (
+# MAGIC SELECT *,
+# MAGIC count(CASE WHEN (customer_id <=> lag_customer_id or customer_id is null) AND (transaction_id <=> lag_transaction_id or transaction_id is null) AND (product_id <=> lag_product_id or product_id is null) then null else 1 END) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as count
+# MAGIC FROM (
+# MAGIC SELECT *,
+# MAGIC lag(customer_id, 1, customer_id) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as lag_customer_id,
+# MAGIC lag(transaction_id, 1, transaction_id) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as lag_transaction_id,
+# MAGIC lag(product_id, 1, product_id) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as lag_product_id
+# MAGIC FROM (
+# MAGIC SELECT col1 as customer_id, col2 as transaction_id, col3 as order_id, col4 as product_id FROM data
+# MAGIC )
+# MAGIC )
+# MAGIC )
+# MAGIC ORDER BY customer_id desc, transaction_id desc, product_id desc
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC CREATE OR REPLACE VIEW data AS
+# MAGIC with batch AS (
+# MAGIC SELECT customer_id, transaction_id, order_id, product_id, ROW_NUMBER() over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as rn_order_id, ROW_NUMBER() over(partition by order_id, count_customer_id order by customer_id desc, transaction_id desc, product_id desc) as rn_customer_id, ROW_NUMBER() over(partition by order_id, count_transaction_id order by customer_id desc, transaction_id desc, product_id desc) as rn_transaction_id, ROW_NUMBER() over(partition by order_id, count_product_id order by customer_id desc, transaction_id desc, product_id desc) as rn_product_id
+# MAGIC FROM (
+# MAGIC SELECT *,
+# MAGIC count(CASE WHEN (customer_id <=> lag_customer_id or customer_id is null) THEN NULL else 1 END) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as count_customer_id, count(CASE WHEN (transaction_id <=> lag_transaction_id or transaction_id is null) THEN null else 1 END) as count_transaction_id, count(CASE WHEN (product_id <=> lag_product_id or product_id is null) then null else 1 END) as count_product_id over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as count
+# MAGIC FROM (
+# MAGIC SELECT *,
+# MAGIC lag(customer_id, 1, customer_id) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as lag_customer_id,
+# MAGIC lag(transaction_id, 1, transaction_id) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as lag_transaction_id,
+# MAGIC lag(product_id, 1, product_id) over(partition by order_id order by customer_id desc, transaction_id desc, product_id desc) as lag_product_id
+# MAGIC FROM (
+# MAGIC SELECT customer_id, transaction_id, order_id, product_id FROM delta.`/Users/leon.eller@databricks.com/tmp/error/batch0`
+# MAGIC )
+# MAGIC )
+# MAGIC )
+# MAGIC )
+# MAGIC SELECT order_id, customer_id, transaction_id, product_id FROM batch
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT order_id, count(*) as count FROM delta.`/Users/leon.eller@databricks.com/tmp/error/batch1`
+# MAGIC GROUP BY order_id
+# MAGIC HAVING count(*) > 1
+# MAGIC ORDER BY count DESC
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT order_id, customer_id, transaction_id, product_id, __rn FROM delta.`/Users/leon.eller@databricks.com/tmp/error/batch1`
+# MAGIC WHERE order_id = '2e9e6a05-2b83-4d03-82f0-6cfb646510ed'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT order_id, customer_id, transaction_id, product_id FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined`
+# MAGIC WHERE order_id = '2e9e6a05-2b83-4d03-82f0-6cfb646510ed'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT a.order_id, a.customer_id, a.transaction_id, a.product_id FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined` a
+# MAGIC JOIN delta.`/Users/leon.eller@databricks.com/tmp/error/batch1` b ON a.order_id = b.order_id
+# MAGIC WHERE a.product_id is null
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC WITH data AS
+# MAGIC (
 # MAGIC SELECT * FROM VALUES(1,null,3, 'a')
 # MAGIC UNION ALL
 # MAGIC SELECT * FROM VALUES(1,2,3, 'a')
@@ -236,7 +333,24 @@ display(batchDf.where("product_id = '977d1a01-a0f9-4c0e-b17b-79b444311dc4'"))
 
 # MAGIC %sql
 # MAGIC 
-# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/batch1` VERSION AS OF 5 --where __u_order_id = 'f2242ba6-9587-47f6-9a9d-61d8f1b5fbd5'
+# MAGIC SELECT row_number() over(partition by order_id, COALESCE(customer_id, f_customer_id), COALESCE(transaction_id, f_transaction_id), COALESCE(product_id, f_product_id) order by customer_id DESC, transaction_id DESC, product_id DESC) as rn, * FROM (
+# MAGIC select first_value(customer_id) over(partition by order_id order by customer_id DESC, transaction_id DESC, product_id DESC) as f_customer_id, first_value(transaction_id) over(partition by order_id order by customer_id DESC, transaction_id DESC, product_id DESC) as f_transaction_id, first_value(product_id) over(partition by order_id order by customer_id DESC, transaction_id DESC, product_id DESC) as f_product_id, * from (
+# MAGIC select customer_id, transaction_id, order_id, product_id from delta.`/Users/leon.eller@databricks.com/tmp/error/batch0` VERSION AS OF 5
+# MAGIC UNION ALL
+# MAGIC SELECT col1 as customer_id, col2 as transaction_id, col3 as order_id, col4 as product_id FROM VALUES('64506617-d7bc-4584-94cb-c5ebb2e6d6db','70be8862-514d-4a0f-93db-4cde24a2cc43','0d6dd69e-3fdb-4edd-ab6c-29762c87713c', /*'426d1e10-61a7-4f56-af33-403f781a7ea6'*/null)
+# MAGIC UNION ALL
+# MAGIC SELECT col1 as customer_id, col2 as transaction_id, col3 as order_id, col4 as product_id FROM VALUES(/*'64506617-d7bc-4584-94cb-c5ebb2e6d6db'*/null,'70be8862-514d-4a0f-93db-4cde24a2cc43','0d6dd69e-3fdb-4edd-ab6c-29762c87713c', '426d1e10-61a7-4f56-af33-403f781a7ea6')
+# MAGIC UNION ALL
+# MAGIC SELECT col1 as customer_id, col2 as transaction_id, col3 as order_id, col4 as product_id FROM VALUES(/*'64506617-d7bc-4584-94cb-c5ebb2e6d6db'*/null,/*'70be8862-514d-4a0f-93db-4cde24a2cc43'*/null,'0d6dd69e-3fdb-4edd-ab6c-29762c87713c', '426d1e10-61a7-4f56-af33-403f781a7ea6')
+# MAGIC )
+# MAGIC )
+# MAGIC where order_id = '0d6dd69e-3fdb-4edd-ab6c-29762c87713c'
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC select * from delta.`/Users/leon.eller@databricks.com/tmp/error/batch0` --VERSION AS OF 5 where order_id = '0d6dd69e-3fdb-4edd-ab6c-29762c87713c'
 
 # COMMAND ----------
 
@@ -258,6 +372,12 @@ display(batch.select(batch0.columns).exceptAll(batch0))
 # COMMAND ----------
 
 spark.read.format('delta').load(f'{gold_path}/joined').createOrReplaceTempView('data')
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC DESCRIBE HISTORY delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/joined`
 
 # COMMAND ----------
 

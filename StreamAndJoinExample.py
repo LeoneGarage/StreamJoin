@@ -313,11 +313,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.select(df_cols).where("product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'"))
+# display(df.select(df_cols).where("product_id = '426d1e10-61a7-4f56-af33-403f781a7ea6'"))
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("product_id = '6a7ba336-932e-4024-99ae-75f3c99acd47'"))
+# display(cc.select(cc_cols).where("product_id = '426d1e10-61a7-4f56-af33-403f781a7ea6'"))
 
 # COMMAND ----------
 
