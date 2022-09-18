@@ -55,7 +55,7 @@ class StreamToStreamJoin:
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinType,
-               [],
+               None,
                [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond).stagingPath()
 
   def on(self,
@@ -64,14 +64,26 @@ class StreamToStreamJoin:
                self._right,
                self._joinType,
                joinExpr,
-               [])._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
+               None)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
  
   def onKeys(self, *keys):
     joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
+    def dropRight(f, l, r):
+      for k in keys:
+        f = f.drop(r[k])
+      return f
+    def dropLeft(f, l, r):
+      for k in keys:
+        f = f.drop(l[k])
+      return f
+    if self._joinType == 'right':
+      func = dropLeft
+    else:
+      func = dropRight
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinType,
-               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)._onKeys(keys)
+               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond).to(func)
 
 # COMMAND ----------
 
@@ -227,53 +239,50 @@ class MicrobatchJoin:
     self._rightPrimaryKeys = rightPrimaryKeys
   
   @staticmethod
-  def _dropDupKeys(pk, f, r):
-    if pk is not None:
-      for k in pk:
-        f = f.drop(r[k])
+  def _transform(func, f, l, r):
+    if func is not None:
+      return func(f, l, r)
     return f
 
   def join(self,
            joinType,
            joinExpr,
-           joinKeyColumnNames,
+           transformFunc,
            selectCols,
            finalSelectCols):
     if isinstance(selectCols, tuple) or isinstance(selectCols, str):
-      dropDupKeys = MicrobatchJoin._dropDupKeys
+      dropDupKeys = MicrobatchJoin._transform
       selectFunc = lambda f, l, r, extraCols: f.selectExpr(*selectCols, *extraCols)
       finalSelectFunc = lambda f, l, r, extraCols: f.selectExpr(*selectCols, *extraCols)
     else:
-      dropDupKeys = lambda pk, f, r: f
+      dropDupKeys = lambda func, f, l, r: f
       selectFunc = lambda f, l, r, extraCols: f.select(*selectCols(l, r), *extraCols)
       finalSelectFunc = lambda f, l, r, extraCols: f.select(*finalSelectCols(l, r), *extraCols)
 
     newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
-    newLeft = dropDupKeys(joinKeyColumnNames, newLeft, self._rightStatic if joinType == 'inner' or joinType == 'left' else self._leftMicrobatch)
+    newLeft = dropDupKeys(transformFunc, newLeft, self._leftMicrobatch, self._rightStatic)
     newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic, [self._leftMicrobatch[c].alias(c) for c in Stream.excludedColumns])
 
     newRight = F.broadcast(self._rightMicrobatch).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
-    newRight = dropDupKeys(joinKeyColumnNames, newRight, self._rightMicrobatch if joinType == 'inner' or joinType == 'left' else self._leftStatic)
+    newRight = dropDupKeys(transformFunc, newRight, self._leftStatic, self._rightMicrobatch)
     newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch, [self._rightMicrobatch[c].alias(c) for c in Stream.excludedColumns])
 
     primaryKeys = list(dict.fromkeys(self._leftPrimaryKeys + self._rightPrimaryKeys))
-    primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k] == newRight[k] for k in primaryKeys])
+    primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k].eqNullSafe(newRight[k]) for k in primaryKeys])
 
     joinedOuter = newLeft.join(newRight, joinExpr(newLeft, newRight) & primaryJoinExpr, 'outer').persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(joinedOuter)
-    if joinType == 'inner':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in joinKeyColumnNames])).select(newRight['*'])
-    elif joinType == 'right':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [(newLeft[pk].isNull()) for pk in joinKeyColumnNames])).select(newRight['*'])
-    elif joinType == 'left':
-      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in joinKeyColumnNames])).select(newLeft['*'])
-      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in joinKeyColumnNames])).select(newRight['*'])
+    if joinType == 'inner' or joinType == 'right' or joinType == 'left':
+      left = joinedOuter.where(reduce(lambda e, pk: e & pk, [newRight[pk].isNull() for pk in primaryKeys])).select(newLeft['*'])
+      right = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNull() for pk in primaryKeys])).select(newRight['*'])
     else:
       raise Exception(f'{joinType} join type is not supported')
-    both = joinedOuter.where(reduce(lambda e, pk: e & pk, [newLeft[pk].isNotNull() & newRight[pk].isNotNull() for pk in joinKeyColumnNames]))
-    both = dropDupKeys(joinKeyColumnNames, both, newLeft)
+    if joinType == 'inner':
+      filter = [(newLeft[pk].isNotNull() & newRight[pk].isNotNull()) for pk in primaryKeys]
+    else:
+      filter = [((newLeft[pk].isNotNull() & newRight[pk].isNotNull()) | (newLeft[pk].isNull() & newRight[pk].isNull())) for pk in primaryKeys]
+    both = joinedOuter.where(reduce(lambda e, pk: e & pk, filter))
+    both = dropDupKeys(transformFunc, both, newLeft, newRight)
     both = selectFunc(both, newLeft, newRight, [F.greatest(newLeft[c], newRight[c]).alias(c) for c in Stream.excludedColumns])
     unionDf = left.unionByName(right).unionByName(both)
     unionDf = unionDf.where(reduce(lambda e, pk: e | pk, [unionDf[pk].isNotNull() for pk in primaryKeys]))
@@ -353,7 +362,7 @@ class StreamingJoin:
 
   def _merge(self,
              joinExpr,
-             joinKeyColumnNames,
+             transformFunc,
              selectCols,
              finalSelectCols):
     leftStatic = self._left.static()
@@ -381,7 +390,7 @@ class StreamingJoin:
       with MicrobatchJoin(left, leftStaticLocal, self._left.getPrimaryKeys(), right, rightStaticLocal, self._right.getPrimaryKeys()) as mj:
         joinedBatchDf = mj.join(self._joinType,
                                 joinExpr,
-                                joinKeyColumnNames,
+                                transformFunc,
                                 selectCols,
                                 finalSelectCols)
         return mergeFunc(joinedBatchDf, batchId)
@@ -389,14 +398,14 @@ class StreamingJoin:
 
   def join(self,
            joinExpr,
-           joinKeyColumnNames,
+           transformFunc,
            selectCols,
            finalSelectCols):
     packed = self._left.stream().select(F.struct('*').alias('left'), F.lit(None).alias('right')).unionByName(self._right.stream().select(F.lit(None).alias('left'), F.struct('*').alias('right')))
     return StreamingQuery(
       (packed
         .writeStream 
-        .foreachBatch(self._merge(joinExpr, joinKeyColumnNames, selectCols, finalSelectCols))
+        .foreachBatch(self._merge(joinExpr, transformFunc, selectCols, finalSelectCols))
       )
     )._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
   
@@ -405,7 +414,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
   _right = None
   _joinType = None
   _joinExpr = None
-  _joinKeys = None
+  _transformFunc = None
   _partitionColumns = None
   _selectCols = None
   _finalSelectCols = None
@@ -417,7 +426,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
                right,
                joinType,
                onCondition,
-               joinKeys,
+               transformFunc,
                partitionColumns,
                selectCols,
                finalSelectCols):
@@ -425,7 +434,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     self._right = right
     self._joinType = joinType
     self._joinExpr = onCondition
-    self._joinKeys = joinKeys
+    self._transformFunc = transformFunc
     self._partitionColumns = partitionColumns
     self._selectCols = selectCols
     self._finalSelectCols = finalSelectCols
@@ -462,7 +471,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
                self._right,
                self._joinType,
                mergeTransformFunc).join(self._joinExpr,
-                               self._joinKeys,
+                               self._transformFunc,
                                self._selectCols,
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
@@ -518,9 +527,14 @@ class StreamToStreamJoinWithConditionForEachBatch:
       return list(dict.fromkeys([pk for pk in nullKeys if pk not in nonNullKeys] + [pk for pk in nullCandidateKeys if pk not in nullKeys]))
 
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
-    ddl = self._left.static().join(self._right.static(),
-                                                   self._joinExpr(self._left.static(), self._right.static())).select(self._finalSelectCols(self._left.static(),
-                          self._right.static())).schema.toDDL()
+    leftStatic = self._left.static()
+    rightStatic = self._right.static()
+    schemaDf = leftStatic.join(rightStatic,
+                                                   self._joinExpr(leftStatic, rightStatic))
+    if self._transformFunc is not None:
+      schemaDf = self._transformFunc(schemaDf, leftStatic, rightStatic)
+    schemaDf = schemaDf.select(self._finalSelectCols(leftStatic, rightStatic))
+    ddl = schemaDf.schema.toDDL()
     createSql = f'CREATE TABLE IF NOT EXISTS {tableName}({ddl}) USING DELTA'
     if path is not None:
       createSql = f"{createSql} LOCATION '{path}'"
@@ -604,7 +618,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
                self._right,
                self._joinType,
                mergeFunc).join(self._joinExpr,
-                               self._joinKeys,
+                               self._transformFunc,
                                self._selectCols,
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
@@ -659,7 +673,7 @@ class StreamToStreamJoinWithCondition:
   _right = None
   _joinType = None
   _joinExpr = None
-  _joinKeys = None
+  _transformFunc = None
   _dependentQuery = None
   _partitionColumns = None
   _upstreamJoinCond = None
@@ -669,13 +683,13 @@ class StreamToStreamJoinWithCondition:
                right,
                joinType,
                onCondition,
-               joinKeys = None,
+               transformFunc = None,
                partitionColumns = None):
     self._left = left
     self._right = right
     self._joinType = joinType
     self._joinExpr = onCondition
-    self._joinKeys = joinKeys
+    self._transformFunc = transformFunc
     self._partitionColumns = partitionColumns
 
   def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
@@ -683,26 +697,41 @@ class StreamToStreamJoinWithCondition:
     self._upstreamJoinCond = upstreamJoinCond
     return self
 
-  def _onKeys(self, keys):
+  def _to(self, func):
+    if self._transformFunc is not None:
+      tFunc = self._transformFunc
+      newFunc = lambda f, l, r: func(tFunc(f, l, r), l, r)
+    else:
+      newFunc = func
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinType,
                self._joinExpr,
-               keys,
+               newFunc,
                self._partitionColumns)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
   
+  def _selectColumns(self, leftCols, rightCols):
+    leftStatic = self._left.static().select([c.columnName() for c in leftCols])
+    rightStatic = self._right.static().select([c.columnName() for c in rightCols])
+    schemaDf = leftStatic.join(rightStatic, self._joinExpr(leftStatic, rightStatic))
+    if self._transformFunc is not None:
+      schemaDf = self._transformFunc(schemaDf, leftStatic, rightStatic)
+    def getColumns(joinedDf, oneSideDf):
+      halfDf = joinedDf
+      for k in oneSideDf.columns:
+        halfDf = halfDf.drop(oneSideDf[k])
+      return halfDf
+    return [ColumnSelector(self._left, c) for c in getColumns(schemaDf, rightStatic).columns] + [ColumnSelector(self._right, c) for c in getColumns(schemaDf, leftStatic).columns]
+
   def stagingPath(self):
     return self.select('*').generateJoinStagingPath()
 
   def partitionBy(self, *columns):
     return self.select('*').partitionBy(*columns)
 
-  def dedupJoinKeys(self, *keys):
-    return self.hintJoinKeys(*keys)
+  def to(self, func):
+    return self._to(func)
 
-  def hintJoinKeys(self, *keys):
-    return self._onKeys(keys)
-  
   def join(self, right, joinType = 'inner', stagingPath = None):
     return self.select('*').join(right, joinType, stagingPath)
 
@@ -755,8 +784,8 @@ class StreamToStreamJoinWithCondition:
         leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.columns()] for c in selectCols if c == '*']
         rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.columns()] for c in selectCols if c == '*']
         leftCols = [lc for arr in leftStars for lc in arr]
-        rightCols = [lc for arr in rightStars for lc in arr if lc.columnName() not in self._joinKeys]
-        allCols = leftCols + rightCols
+        rightCols = [lc for arr in rightStars for lc in arr]
+        allCols = self._selectColumns(leftCols, rightCols)
         if len(allCols) > 0:
           return self.select(*allCols)
         else:
@@ -768,7 +797,7 @@ class StreamToStreamJoinWithCondition:
                self._right,
                self._joinType,
                self._joinExpr,
-               self._joinKeys,
+               self._transformFunc,
                self._partitionColumns,
                selectFunc,
                finalSelectFunc)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
