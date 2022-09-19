@@ -218,25 +218,19 @@ class Stream:
 class MicrobatchJoin:
   _leftMicrobatch = None
   _leftStatic = None
-  _leftPrimaryKeys = None
   _rightMicrobatch = None
   _rightStatic = None
-  _rightPrimaryKeys = None
   _persisted = []
 
   def __init__(self,
                leftMicrobatch,
                leftStatic,
-               leftPrimaryKeys,
                rightMicrobatch,
-               rightStatic,
-               rightPrimaryKeys):
+               rightStatic):
     self._leftMicrobatch = leftMicrobatch
     self._leftStatic = leftStatic
-    self._leftPrimaryKeys = leftPrimaryKeys
     self._rightMicrobatch = rightMicrobatch
     self._rightStatic = rightStatic
-    self._rightPrimaryKeys = rightPrimaryKeys
   
   @staticmethod
   def _transform(func, f, l, r):
@@ -247,27 +241,27 @@ class MicrobatchJoin:
   def join(self,
            joinType,
            joinExpr,
+           primaryKeys,
            transformFunc,
            selectCols,
            finalSelectCols):
     if isinstance(selectCols, tuple) or isinstance(selectCols, str):
       dropDupKeys = MicrobatchJoin._transform
-      selectFunc = lambda f, l, r, extraCols: f.selectExpr(*selectCols, *extraCols)
-      finalSelectFunc = lambda f, l, r, extraCols: f.selectExpr(*selectCols, *extraCols)
+      selectFunc = lambda f, l, r: f.selectExpr(*selectCols)
+      finalSelectFunc = lambda f, l, r: f.selectExpr(*selectCols)
     else:
       dropDupKeys = lambda func, f, l, r: f
-      selectFunc = lambda f, l, r, extraCols: f.select(*selectCols(l, r), *extraCols)
-      finalSelectFunc = lambda f, l, r, extraCols: f.select(*finalSelectCols(l, r), *extraCols)
+      selectFunc = lambda f, l, r: f.select(*selectCols(l, r))
+      finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(l, r))
 
     newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
     newLeft = dropDupKeys(transformFunc, newLeft, self._leftMicrobatch, self._rightStatic)
-    newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic, [self._leftMicrobatch[c].alias(c) for c in Stream.excludedColumns])
+    newLeft = selectFunc(newLeft, self._leftMicrobatch, self._rightStatic)
 
     newRight = F.broadcast(self._rightMicrobatch).join(self._leftStatic, joinExpr(self._leftStatic, self._rightMicrobatch), 'left' if joinType == 'right' else 'inner')
     newRight = dropDupKeys(transformFunc, newRight, self._leftStatic, self._rightMicrobatch)
-    newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch, [self._rightMicrobatch[c].alias(c) for c in Stream.excludedColumns])
+    newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
 
-    primaryKeys = list(dict.fromkeys(self._leftPrimaryKeys + self._rightPrimaryKeys))
     primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k].eqNullSafe(newRight[k]) for k in primaryKeys])
 
     joinedOuter = newLeft.join(newRight, joinExpr(newLeft, newRight) & primaryJoinExpr, 'outer').persist(StorageLevel.MEMORY_AND_DISK)
@@ -283,10 +277,10 @@ class MicrobatchJoin:
       filter = [((newLeft[pk].isNotNull() & newRight[pk].isNotNull()) | (newLeft[pk].isNull() & newRight[pk].isNull())) for pk in primaryKeys]
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, filter))
     both = dropDupKeys(transformFunc, both, newLeft, newRight)
-    both = selectFunc(both, newLeft, newRight, [F.greatest(newLeft[c], newRight[c]).alias(c) for c in Stream.excludedColumns])
+    both = selectFunc(both, newLeft, newRight)
     unionDf = left.unionByName(right).unionByName(both)
     unionDf = unionDf.where(reduce(lambda e, pk: e | pk, [unionDf[pk].isNotNull() for pk in primaryKeys]))
-    finalDf = finalSelectFunc(unionDf, unionDf, unionDf, [unionDf[c] for c in Stream.excludedColumns])
+    finalDf = finalSelectFunc(unionDf, unionDf, unionDf)
     finalDf = finalDf.persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(finalDf)
     return finalDf
@@ -354,6 +348,7 @@ class StreamingJoin:
     self._right = right
     self._joinType = joinType
     self._mergeFunc = mergeFunc
+    self._primaryKeys = list(dict.fromkeys(self._left.getPrimaryKeys() + self._right.getPrimaryKeys()))
 
   def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
@@ -387,9 +382,10 @@ class StreamingJoin:
         leftStaticLocal = self._left.static(leftMaxCommitVersion)
       if rightMaxCommitVersion is not None:
         rightStaticLocal = self._right.static(rightMaxCommitVersion)
-      with MicrobatchJoin(left, leftStaticLocal, self._left.getPrimaryKeys(), right, rightStaticLocal, self._right.getPrimaryKeys()) as mj:
+      with MicrobatchJoin(left, leftStaticLocal, right, rightStaticLocal) as mj:
         joinedBatchDf = mj.join(self._joinType,
                                 joinExpr,
+                                self._primaryKeys,
                                 transformFunc,
                                 selectCols,
                                 finalSelectCols)
@@ -728,6 +724,13 @@ class StreamToStreamJoinWithCondition:
 
   def partitionBy(self, *columns):
     return self.select('*').partitionBy(*columns)
+
+  def drop(self, column):
+    if column.stream() == self._right.stream():
+      func = lambda f, l, r: f.drop(r[column.columnName()])
+    else:
+      func = lambda f, l, r: f.drop(l[column.columnName()])
+    return self.to(func)
 
   def to(self, func):
     return self._to(func)
