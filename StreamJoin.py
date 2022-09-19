@@ -60,6 +60,9 @@ class StreamToStreamJoin:
 
   def on(self,
            joinExpr):
+    if isinstance(joinExpr, Expression):
+      joinExpr = joinExpr.toColumn(self._left, self._right)
+
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinType,
@@ -87,6 +90,81 @@ class StreamToStreamJoin:
 
 # COMMAND ----------
 
+class Expression:
+  _left = None
+  _right = None
+  
+  def __init__(self,
+               left,
+               right):
+    self._left = left
+    self._right = right
+    
+  def toColumn(self, left, right):
+    pass
+
+  def _toColumnFunc(self, left, right, func):
+    leftExpr = self._left.toColumn(left, right)
+    rightExpr = self._right.toColumn(left, right)
+    return func(leftExpr, rightExpr)
+
+  def _create(self, other, func):
+    if isinstance(other, ColumnSelector):
+      return func(self, ColumnRef(other))
+    elif isinstance(other, Expression):
+      return func(self, other)
+    elif isinstance(other, Column):
+      return func(self, ColumnRef(other))
+    else:
+      raise Exception(f'Expression of type {type(other)} is not supported')
+    
+  def __eq__(self, other):
+    return self._create(other, lambda l, r: Equals(l, r))
+
+  def __and__(self, other):
+    return self._create(other, lambda l, r: And(l, r))
+
+  def __or__(self, other):
+    return self._create(other, lambda l, r: Or(l, r))
+
+class ColumnRef(Expression):
+  def __init__(self, ref):
+    super().__init__(ref, ref)
+
+  def toColumn(self, left, right):
+    if isinstance(self._right, ColumnSelector):
+      if self._right.frame() is right:
+        columnName = self._right.columnName()
+        return lambda l, r: r[columnName]
+      columnName = self._right.columnName()
+      return lambda l, r: l[columnName]
+    else:
+      col = self._right
+      return lambda l, r: col
+
+class Equals(Expression):
+  def __init__(self, left, right):
+    super().__init__(left, right)
+    
+  def toColumn(self, left, right):
+    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: le(l, r) == re(l, r))
+
+class And(Expression):
+  def __init__(self, left, right):
+    super().__init__(left, right)
+    
+  def toColumn(self, left, right):
+    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: le(l, r) & re(l, r))
+
+class Or(Expression):
+  def __init__(self, left, right):
+    super().__init__(left, right)
+    
+  def toColumn(self, left, right):
+    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: le(l, r) | re(l, r))
+
+# COMMAND ----------
+
 class ColumnSelector:
   _stream = None
   _columnName = None
@@ -97,6 +175,9 @@ class ColumnSelector:
                columnName):
     self._stream = stream
     self._columnName = columnName
+
+  def frame(self):
+    return self._stream
 
   def stream(self):
     return self._stream.stream()
@@ -112,6 +193,12 @@ class ColumnSelector:
   def to(self, func):
     self._func = func
     return self
+  
+  def __eq__(self, other):
+    return ColumnRef(self) == other
+
+  def __and__(self, other):
+    return ColumnRef(self) & other
 
 # COMMAND ----------
 
@@ -262,7 +349,7 @@ class MicrobatchJoin:
     newRight = dropDupKeys(transformFunc, newRight, self._leftStatic, self._rightMicrobatch)
     newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
 
-    primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k].eqNullSafe(newRight[k]) for k in primaryKeys])
+    primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k] == newRight[k] for k in primaryKeys])
 
     joinedOuter = newLeft.join(newRight, joinExpr(newLeft, newRight) & primaryJoinExpr, 'outer').persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(joinedOuter)
@@ -274,7 +361,7 @@ class MicrobatchJoin:
     if joinType == 'inner':
       filter = [(newLeft[pk].isNotNull() & newRight[pk].isNotNull()) for pk in primaryKeys]
     else:
-      filter = [((newLeft[pk].isNotNull() & newRight[pk].isNotNull()) | (newLeft[pk].isNull() & newRight[pk].isNull())) for pk in primaryKeys]
+      filter = [(newLeft[pk].isNotNull() & newRight[pk].isNotNull()) for pk in primaryKeys]
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, filter))
     both = dropDupKeys(transformFunc, both, newLeft, newRight)
     both = selectFunc(both, newLeft, newRight)
@@ -566,8 +653,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
       outerCond = F.expr(outerCondStr)
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
-      outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([f'u.{pk}' for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns] + [F.expr('(' + ' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]) + ')')])
-      dedupWindowSpec = Window.partitionBy([f'__u_{pk}' for pk in primaryKeys]).orderBy([F.desc(f'{pk}') for pk in primaryKeys])
+      outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc(f'u.{pk}') for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns] + [F.expr('(' + ' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]) + ')')])
       cond = '__rn = 1 AND ' + cond
       updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableForFunc().toDF().columns}
     else:
