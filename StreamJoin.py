@@ -93,15 +93,19 @@ class StreamToStreamJoin:
 class Expression:
   _left = None
   _right = None
+  _func = None
   
   def __init__(self,
                left,
-               right):
+               right,
+               func = None):
     self._left = left
     self._right = right
-    
+    self._func = func
+
   def toColumn(self, left, right):
-    pass
+    func = self._func
+    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: func(le(l, r), re(l, r)))
 
   def _toColumnFunc(self, left, right, func):
     leftExpr = self._left.toColumn(left, right)
@@ -119,13 +123,23 @@ class Expression:
       raise Exception(f'Expression of type {type(other)} is not supported')
     
   def __eq__(self, other):
-    return self._create(other, lambda l, r: Equals(l, r))
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a == b))
+  def __lt__(self, other):
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a < b))
+  def __gt__(self, other):
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a > b))
+  def __le__(self, other):
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a <= b))
+  def __ge__(self, other):
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a >= b))
+  def __ne__(self, other):
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a != b))
 
   def __and__(self, other):
-    return self._create(other, lambda l, r: And(l, r))
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a & b))
 
   def __or__(self, other):
-    return self._create(other, lambda l, r: Or(l, r))
+    return self._create(other, lambda l, r: Expression(l, r, lambda a, b: a | b))
 
 class ColumnRef(Expression):
   def __init__(self, ref):
@@ -141,27 +155,6 @@ class ColumnRef(Expression):
     else:
       col = self._right
       return lambda l, r: col
-
-class Equals(Expression):
-  def __init__(self, left, right):
-    super().__init__(left, right)
-    
-  def toColumn(self, left, right):
-    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: le(l, r) == re(l, r))
-
-class And(Expression):
-  def __init__(self, left, right):
-    super().__init__(left, right)
-    
-  def toColumn(self, left, right):
-    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: le(l, r) & re(l, r))
-
-class Or(Expression):
-  def __init__(self, left, right):
-    super().__init__(left, right)
-    
-  def toColumn(self, left, right):
-    return self._toColumnFunc(left, right, lambda le, re: lambda l, r: le(l, r) | re(l, r))
 
 # COMMAND ----------
 
@@ -196,6 +189,16 @@ class ColumnSelector:
   
   def __eq__(self, other):
     return ColumnRef(self) == other
+  def __lt__(self, other):
+    return ColumnRef(self) < other
+  def __gt__(self, other):
+    return ColumnRef(self) > other
+  def __le__(self, other):
+    return ColumnRef(self) <= other
+  def __ge__(self, other):
+    return ColumnRef(self) >= other
+  def __ne__(self, other):
+    return ColumnRef(self) != other
 
   def __and__(self, other):
     return ColumnRef(self) & other
@@ -210,13 +213,16 @@ class Stream:
   _sequenceColumns = None
   _path = None
   _name = None
+  _isTable = None
   excludedColumns = ['_commit_version']
 
   def __init__(self,
                stream,
-               staticReader):
+               staticReader,
+               isTable):
     self._stream = stream
     self._staticReader = staticReader
+    self._isTable = isTable
   
   @staticmethod
   def readAtVersion(reader, version = None):
@@ -233,7 +239,7 @@ class Stream:
       cdfStream.option("startingVersion", "{startingVersion}")
     cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
     reader = spark.read.format('delta')
-    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).load(path)).setPath(path)
+    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).load(path), False).setPath(path)
 
   @staticmethod
   def fromTable(tableName, startingVersion = None):
@@ -242,7 +248,7 @@ class Stream:
       cdfStream.option("startingVersion", "{startingVersion}")
     cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
     reader = spark.read.format('delta')
-    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).table(tableName)).setName(tableName).setPath(tableName)
+    return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).table(tableName), True).setName(tableName).setPath(tableName)
 
   def __getitem__(self, key):
     return ColumnSelector(self, key)
@@ -275,6 +281,11 @@ class Stream:
         self._static = self._staticReader(version)
       return self._static
     return self._staticReader(version)
+
+  def getLatestVersion(self):
+    if self._isTable is True:
+      return DeltaTable.forName(spark, self.name()).history(1).select('version').collect()[0][0]
+    return DeltaTable.forPath(spark, self.path()).history(1).select('version').collect()[0][0]
 
   def primaryKeys(self, *keys):
     self._primaryKeys = keys
@@ -349,7 +360,7 @@ class MicrobatchJoin:
     newRight = dropDupKeys(transformFunc, newRight, self._leftStatic, self._rightMicrobatch)
     newRight = selectFunc(newRight, self._leftStatic, self._rightMicrobatch)
 
-    primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k] == newRight[k] for k in primaryKeys])
+    primaryJoinExpr = reduce(lambda e, pk: e & pk, [newLeft[k].eqNullSafe(newRight[k]) for k in primaryKeys])
 
     joinedOuter = newLeft.join(newRight, joinExpr(newLeft, newRight) & primaryJoinExpr, 'outer').persist(StorageLevel.MEMORY_AND_DISK)
     self._persisted.append(joinedOuter)
@@ -361,7 +372,7 @@ class MicrobatchJoin:
     if joinType == 'inner':
       filter = [(newLeft[pk].isNotNull() & newRight[pk].isNotNull()) for pk in primaryKeys]
     else:
-      filter = [(newLeft[pk].isNotNull() & newRight[pk].isNotNull()) for pk in primaryKeys]
+      filter = [((newLeft[pk].isNotNull() & newRight[pk].isNotNull()) | (newLeft[pk].isNull() & newRight[pk].isNull())) for pk in primaryKeys]
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, filter))
     both = dropDupKeys(transformFunc, both, newLeft, newRight)
     both = selectFunc(both, newLeft, newRight)
@@ -450,7 +461,11 @@ class StreamingJoin:
     leftStatic = self._left.static()
     rightStatic = self._right.static()
     mergeFunc = self._mergeFunc
+    lastLeftMaxCommitVersion = None
+    lastRightMaxCommitVersion = None
     def _mergeJoin(batchDf, batchId):
+      nonlocal lastLeftMaxCommitVersion
+      nonlocal lastRightMaxCommitVersion
       left = batchDf.where('left is not null').select('left.*')
       right = batchDf.where('right is not null').select('right.*')
       maxCommitVersions = (
@@ -465,10 +480,20 @@ class StreamingJoin:
       rightMaxCommitVersion = maxCommitVersions[1]
       leftStaticLocal = leftStatic
       rightStaticLocal = rightStatic
+      if leftMaxCommitVersion is None:
+        leftMaxCommitVersion = lastLeftMaxCommitVersion
+      if rightMaxCommitVersion is None:
+        rightMaxCommitVersion = lastRightMaxCommitVersion
+      if leftMaxCommitVersion is None:
+        leftMaxCommitVersion = self._left.getLatestVersion()
+      if rightMaxCommitVersion is None:
+        rightMaxCommitVersion = self._right.getLatestVersion()
       if leftMaxCommitVersion is not None:
         leftStaticLocal = self._left.static(leftMaxCommitVersion)
       if rightMaxCommitVersion is not None:
         rightStaticLocal = self._right.static(rightMaxCommitVersion)
+      lastLeftMaxCommitVersion = leftMaxCommitVersion
+      lastRightMaxCommitVersion = rightMaxCommitVersion
       with MicrobatchJoin(left, leftStaticLocal, right, rightStaticLocal) as mj:
         joinedBatchDf = mj.join(self._joinType,
                                 joinExpr,
@@ -648,6 +673,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     matchCondition = None
     insertFilter = None
     updateFilter = None
+    deltaTableColumns = deltaTableForFunc().toDF().columns
     if len(pks[1]) > 0:
       outerCondStr = self._mergeCondition(pks[0], pks[1])
       outerCond = F.expr(outerCondStr)
@@ -655,14 +681,15 @@ class StreamToStreamJoinWithConditionForEachBatch:
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
       outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc(f'u.{pk}') for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns] + [F.expr('(' + ' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]) + ')')])
       cond = '__rn = 1 AND ' + cond
-      updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableForFunc().toDF().columns}
+      updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableColumns}
     else:
-      updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableForFunc().toDF().columns}
+      updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableColumns}
     windowSpec = None
     if sequenceColumns is not None and len(sequenceColumns) > 0:
-      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
+      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns] + [F.expr('(' + ' + '.join([f'CASE WHEN {c} is not null THEN 0 ELSE 1 END' for c in deltaTableColumns]) + ')')])
       matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{"__u_" if len(pks[1]) > 0 else ""}{sc})' for sc in sequenceColumns])
-    deltaTableColumns = deltaTableForFunc().toDF().columns
+    else:
+      windowSpec = Window.partitionBy(primaryKeys).orderBy([F.expr('(' + ' + '.join([f'CASE WHEN {c} is not null THEN 0 ELSE 1 END' for c in deltaTableColumns]) + ')')])
     if outerCond is not None:
       batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in primaryKeys] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
       operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
