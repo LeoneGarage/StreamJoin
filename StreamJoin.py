@@ -667,6 +667,12 @@ class StreamToStreamJoinWithConditionForEachBatch:
 #     print(f'%%%%%%%%%% pks[0] = {pks[0]}')
 #     print(f'%%%%%%%%%% pks[1] = {pks[1]}')
     cond = ' AND '.join([f'u.{pk} = staged_updates.{pk}' for pk in pks[0]] + [f'u.{pk} <=> staged_updates.{pk}' for pk in pks[1]])
+    partitionColumnsExpr = None
+    partitionColumns = []
+    if self._partitionColumns is not None and len(self._partitionColumns) > 0:
+      partitionColumns = list(self._partitionColumns)
+      partitionColumnsExpr = ' AND '.join([f'(u.{pc} <=> staged_updates.{pc}' + (f' OR u.{pc} is null' if len(pks[1]) > 0 else '') + ')' for pc in partitionColumns])
+      cond = f'({partitionColumnsExpr}) AND ({cond})'
     outerCond = None
     dedupWindowSpec = None
     outerWindowSpec = None
@@ -676,6 +682,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
     deltaTableColumns = deltaTableForFunc().toDF().columns
     if len(pks[1]) > 0:
       outerCondStr = self._mergeCondition(pks[0], pks[1])
+      if partitionColumnsExpr is not None:
+        outerCondStr = f'{partitionColumnsExpr} AND {outerCondStr}'
       outerCond = F.expr(outerCondStr)
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
@@ -691,7 +699,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
     else:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.expr('(' + ' + '.join([f'CASE WHEN {c} is not null THEN 0 ELSE 1 END' for c in deltaTableColumns]) + ')')])
     if outerCond is not None:
-      batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in primaryKeys] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
+      targetMergeKeyColumns = self._safeMergeLists(primaryKeys, partitionColumns)
+      batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in targetMergeKeyColumns] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
       operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
       nullsCol = F.expr(' + '.join([f'CASE WHEN {pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
       stagedNullsCol = F.expr(' + '.join([f'CASE WHEN __u_{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
@@ -769,7 +778,9 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = func
     else:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
-    return Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys).join(right, joinType)._chainStreamingQuery(joinQuery, joinCondFunc)
+    return ( Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
+               .join(right, joinType)
+               ._chainStreamingQuery(joinQuery, joinCondFunc) )
     
   def writeToPath(self, path):
     return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)
