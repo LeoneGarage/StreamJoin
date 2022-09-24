@@ -167,9 +167,9 @@ def mergeGold(batchDf, batchId):
 
 a = (
       Stream.fromPath(f'{silver_path}/customers')
-        .to(lambda df: df.withColumn('customer_id', df['id']).drop('id')) # drop duplicate id columns and rename customer's id to customer_id
-        .to(lambda df: df.withColumn('customer_operation', df['operation']).drop('operation')) # drop duplicate operation columns and rename customer's oeration to customer_operation
-        .to(lambda df: df.withColumn('customer_operation_date', df['operation_date']).drop('operation_date')) # drop duplicate operation_date columns and rename customer's operation_date to customer_operation_date
+        .to(lambda df: df.withColumnRenamed('id', 'customer_id')) # drop duplicate id columns and rename customer's id to customer_id
+        .to(lambda df: df.withColumnRenamed('operation', 'customer_operation')) # drop duplicate operation columns and rename customer's oeration to customer_operation
+        .to(lambda df: df.withColumnRenamed('operation_date', 'customer_operation_date')) # drop duplicate operation_date columns and rename customer's operation_date to customer_operation_date
         .primaryKeys('customer_id')
         .sequenceBy('customer_operation_date')
     )
@@ -177,6 +177,7 @@ a = (
 b = (
       Stream.fromPath(f'{silver_path}/transactions')
       .to(lambda df: df.withColumnRenamed('id', 'transaction_id'))
+      .to(lambda df: df.withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100))
       .primaryKeys('transaction_id')
       .sequenceBy('operation_date')
     )
@@ -194,17 +195,24 @@ d = (
       Stream.fromPath(f'{silver_path}/products')
             .to(lambda df: df.withColumnRenamed('id', 'product_id'))
             .to(lambda df: df.withColumnRenamed('item_name', 'product_name'))
+            .to(lambda df: df.withColumnRenamed('order_id', 'product_order_id'))
             .primaryKeys('product_id')
             .sequenceBy('item_operation_date')
     )
 
 j = (
   a.join(b, 'right')
-  .onKeys('customer_id')
+  .onKeys('customer_id').partitionBy('date')
   .join(c, 'right')
-  .onKeys('transaction_id')
+  .onKeys('transaction_id').partitionBy('date')
   .join(d, 'left')
-  .onKeys('order_id')
+  .on((d['product_name'] == c['item_name']) & (d['product_name'] == F.lit('Small Towels')))
+#   .on(lambda l, r: (r['product_name'] == l['item_name']) & (r['product_name'] == F.lit('Small Towels')))
+#  .drop(d['order_id'])
+#   .to(lambda f, l, r: f.drop(r['order_id']))
+#   .on(lambda l, r: l['item_name'] == r['product_name'])
+#  .hintJoinKeys('item_name', 'product_name')
+#  .onKeys('order_id')
   .writeToPath(f'{gold_path}/joined')
 #  .foreachBatch(mergeGold)
   .option("checkpointLocation", f'{checkpointLocation}/gold/joined')
@@ -214,28 +222,56 @@ j = (
 
 # COMMAND ----------
 
+# path = (a.join(b, 'right')
+#   .onKeys('customer_id')).stagingPath()
+# display(DeltaTable.forPath(spark, f'{path}/data').history())
+
+# COMMAND ----------
+
+# dbutils.fs.rm(f'{checkpointLocation}/test/cp', True)
+# dbutils.fs.rm(f'{silver_path}/test', True)
+
+# inDf = (
+#          spark.readStream
+# #         .option('ignoreChanges', True)
+#            .option("readChangeFeed", "true")
+#            .format('delta')
+#            .load('/Users/leon.eller@databricks.com/tmp/demo/silver/$$_customers_transactions/right/b72b7fd1451c20a2f17f376784a9a5ad718c0a58fbfe344f642902c191eca371/data')
+#        )
+
+# inDf = inDf.drop('_change_type', '_commit_timestamp', '_commit_version').where('date = 20220300')
+
+# (
+#   inDf.writeStream.format('delta')
+#       .option('checkpointLocation', f'{checkpointLocation}/test/cp')
+#       .start(f'{silver_path}/test')
+# )
+
+# COMMAND ----------
+
 aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
-bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
+bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id').withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100)
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
 pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
-aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
-aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
-cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id']).drop(aa['customer_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id']).drop(aa_bb['transaction_id'])
+cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id']).drop(pp['order_id'])
 cc.count()
 
 # COMMAND ----------
 
-# ab = spark.read.format('delta').load(f"{a.join(b, 'left').stagingPath()}/data")
-# ab_cols = ab.columns
-# ab_cols.sort()
-# aa_bb_cols = aa_bb.columns
-# aa_bb_cols.sort()
-# print(ab.select(ab_cols).exceptAll(aa_bb.select(aa_bb_cols)).count())
-# print(aa_bb.select(aa_bb_cols).exceptAll(ab.select(ab_cols)).count())
+aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
+bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id').withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100)
+oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
+pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name').withColumnRenamed('order_id', 'product_order_id')
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
+cc = aa_bb_oo.join(pp, (pp['product_name'] == aa_bb_oo['item_name']) & (pp['product_name'] == F.lit('Small Towels')), 'left')#.drop(pp['order_id'])
+cc.count()
 
 # COMMAND ----------
 
-df = spark.read.format('delta').load(f'{gold_path}/joined').select(cc.columns)
+df = spark.read.format('delta').load(f'{gold_path}/joined')
 df.count()
 
 # COMMAND ----------
@@ -313,11 +349,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-# display(df.select(df_cols).where("product_id = 'b1fc15c2-ab81-4575-bea5-e55917db8c31'"))
+display(df.select(df_cols).where("customer_id = '9b977761-628e-486f-a7f8-9433ac1cd0b2' and product_id = '7f60df08-0f03-4e2e-a43f-3b43c1687a15'"))
 
 # COMMAND ----------
 
-# display(cc.select(cc_cols).where("product_id = '6a7ba336-932e-4024-99ae-75f3c99acd47'"))
+display(cc.select(cc_cols).where("customer_id = '9b977761-628e-486f-a7f8-9433ac1cd0b2' and product_id = '7f60df08-0f03-4e2e-a43f-3b43c1687a15'"))
 
 # COMMAND ----------
 

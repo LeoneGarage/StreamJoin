@@ -70,6 +70,74 @@ gold_path = f"/Users/{user}/tmp/demo/gold"
 
 # COMMAND ----------
 
+# MAGIC %sql
+# MAGIC 
+# MAGIC DESCRIBE HISTORY delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers`
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC select _metadata.file_path from delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers`
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC ALTER TABLE delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` DROP column (filename);
+
+# COMMAND ----------
+
+# MAGIC %fs
+# MAGIC 
+# MAGIC ls /Users/leon.eller@databricks.com/tmp/demo/silver/customers/_delta_log/
+
+# COMMAND ----------
+
+version = spark.read.format('json').load('/Users/leon.eller@databricks.com/tmp/demo/silver/customers/_delta_log/00000000000000000009.json')
+
+# COMMAND ----------
+
+display(version.where('add is null'))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC ALTER TABLE delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` ALTER column filename SET DEFAULT input_file_name()
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC MERGE INTO delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` target
+# MAGIC USING (SELECT DISTINCT input_file_name() as filename FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` VERSION AS OF 100
+# MAGIC EXCEPT ALL
+# MAGIC SELECT DISTINCT input_file_name() as filename FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` VERSION AS OF 99) source
+# MAGIC ON target._metadata = source.filename
+# MAGIC WHEN MATCHED
+# MAGIC   THEN DELETE
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers`
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC DELETE FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` AS d WHERE EXISTS (
+# MAGIC SELECT filename FROM (
+# MAGIC SELECT DISTINCT input_file_name() as filename FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` VERSION AS OF 100
+# MAGIC EXCEPT ALL
+# MAGIC SELECT DISTINCT input_file_name() as filename FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/silver/customers` VERSION AS OF 99
+# MAGIC ) WHERE d.filename = filename
+# MAGIC )
+
+# COMMAND ----------
+
 a = (
       Stream.fromPath(f'{silver_path}/customers')
         .to(lambda df: df.withColumn('customer_id', df['id']).drop('id')) # drop duplicate id columns and rename customer's id to customer_id
