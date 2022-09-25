@@ -202,9 +202,9 @@ d = (
 
 j = (
   a.join(b, 'right')
-  .onKeys('customer_id').partitionBy('date')
+  .onKeys('customer_id').partitionBy(prune('date'))
   .join(c, 'right')
-  .onKeys('transaction_id').partitionBy('date')
+  .onKeys('transaction_id').partitionBy(prune('date'))
   .join(d, 'left')
   .on((d['product_name'] == c['item_name']) & (d['product_name'] == F.lit('Small Towels')))
 #   .on(lambda l, r: (r['product_name'] == l['item_name']) & (r['product_name'] == F.lit('Small Towels')))

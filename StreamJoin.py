@@ -313,6 +313,39 @@ class Stream:
 
 # COMMAND ----------
 
+class PartitionColumn:
+  _column = None
+  _staticPruned = False
+
+  def __init__(self,
+               column):
+    if isinstance(column, prune):
+      self._column = column.column()
+      self._staticPruned = True
+    else:
+      self._column = column
+      self._staticPruned = False
+  
+  def column(self):
+    return self._column
+  
+  def isStaticPruned(self):
+    return self._staticPruned
+
+# COMMAND ----------
+
+class prune:
+  _column = None
+
+  def __init__(self,
+               column):
+    self._column = column
+
+  def column(self):
+    return self._column
+
+# COMMAND ----------
+
 class MicrobatchJoin:
   _leftMicrobatch = None
   _leftStatic = None
@@ -564,7 +597,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     return a
 
   def partitionBy(self, *columns):
-    self._partitionColumns = columns
+    self._partitionColumns = [(c if isinstance(c, PartitionColumn) else PartitionColumn(c)) for c in columns]
     return self
 
   def foreachBatch(self, mergeFunc):
@@ -634,6 +667,21 @@ class StreamToStreamJoinWithConditionForEachBatch:
     elif joinType == 'right':
       return list(dict.fromkeys([pk for pk in nullKeys if pk not in nonNullKeys] + [pk for pk in nullCandidateKeys if pk not in nullKeys]))
 
+  def _buildPrunedPartitionColumnFunc(self, prunedPartitionColumns, partitionColumnsExpr, hasNullableKeys):
+    partitionColumnsExprFunc = None
+    if len(prunedPartitionColumns) > 0:
+      def pruneFunc(batchDf):
+        colValues = [batchDf.select(pc.column()).distinct().collect() for pc in prunedPartitionColumns]
+        colValues = [[f"'{v[0]}'" if isinstance(v[0], str) else str(v[0]) if v[0] is not None else 'null' for v in vals] for vals in colValues]
+        pcAndVals = [(pc, vals) for pc, vals in zip(prunedPartitionColumns, colValues)]
+        expr = ' AND '.join([f"(u.{pc[0].column()} in ({','.join(pc[1])})" + (f' OR u.{pc[0].column()} is null' if hasNullableKeys else '') + ')' for pc in pcAndVals if len(pc[1]) > 0])
+        return expr
+      if partitionColumnsExpr is not None and len(partitionColumnsExpr) > 0:
+        partitionColumnsExprFunc = lambda batchDf: f'{partitionColumnsExpr} AND {pruneFunc(batchDf)}'
+      else:
+        partitionColumnsExprFunc = pruneFunc
+    return partitionColumnsExprFunc
+
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
     leftStatic = self._left.static()
     rightStatic = self._right.static()
@@ -647,7 +695,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if path is not None:
       createSql = f"{createSql} LOCATION '{path}'"
     if self._partitionColumns is not None:
-      createSql = f"{createSql} PARTITIONED BY ({', '.join([pc for pc in self._partitionColumns])})"
+      createSql = f"{createSql} PARTITIONED BY ({', '.join([pc.column() for pc in self._partitionColumns])})"
     spark.sql(createSql)
 
     primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
@@ -666,14 +714,18 @@ class StreamToStreamJoinWithConditionForEachBatch:
     pks = [self._mergeNonNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1]), self._mergeNullKeysForJoin(self._joinType, pks[0], pks[1], pks1[0], pks1[1])]
 #     print(f'%%%%%%%%%% pks[0] = {pks[0]}')
 #     print(f'%%%%%%%%%% pks[1] = {pks[1]}')
-    cond = ' AND '.join([f'u.{pk} = staged_updates.{pk}' for pk in pks[0]] + [f'u.{pk} <=> staged_updates.{pk}' for pk in pks[1]])
-    partitionColumnsExpr = None
+    condInitial = ' AND '.join([f'u.{pk} = staged_updates.{pk}' for pk in pks[0]] + [f'u.{pk} <=> staged_updates.{pk}' for pk in pks[1]])
     partitionColumns = []
+    prunedPartitionColumns = []
+    partitionColumnsExprFunc = None
     if self._partitionColumns is not None and len(self._partitionColumns) > 0:
       partitionColumns = list(self._partitionColumns)
-      partitionColumnsExpr = ' AND '.join([f'(u.{pc} <=> staged_updates.{pc}' + (f' OR u.{pc} is null' if len(pks[1]) > 0 else '') + ')' for pc in partitionColumns])
-      cond = f'({partitionColumnsExpr}) AND ({cond})'
-    outerCond = None
+      prunedPartitionColumns = [pc for pc in partitionColumns if pc.isStaticPruned()]
+      partitionColumnsExpr = ' AND '.join([f'(u.{pc.column()} <=> staged_updates.{pc.column()}' + (f' OR u.{pc.column()} is null' if len(pks[1]) > 0 else '') + ')' for pc in partitionColumns if not pc.isStaticPruned()])
+      partitionColumnsExprFunc = self._buildPrunedPartitionColumnFunc(prunedPartitionColumns, partitionColumnsExpr, len(pks[1]) > 0)
+      if partitionColumnsExprFunc is None:
+        condInitial = f'({partitionColumnsExpr}) AND ({condInitial})'
+    outerCondInitial = None
     dedupWindowSpec = None
     outerWindowSpec = None
     matchCondition = None
@@ -682,13 +734,13 @@ class StreamToStreamJoinWithConditionForEachBatch:
     deltaTableColumns = deltaTableForFunc().toDF().columns
     if len(pks[1]) > 0:
       outerCondStr = self._mergeCondition(pks[0], pks[1])
-      if partitionColumnsExpr is not None:
+      if len(partitionColumns) > 0 and len(prunedPartitionColumns) == 0:
         outerCondStr = f'{partitionColumnsExpr} AND {outerCondStr}'
-      outerCond = F.expr(outerCondStr)
+      outerCondInitial = F.expr(outerCondStr)
       insertFilter = ' AND '.join([f'u.{pk} is null' for pk in pks[0]])
       updateFilter = ' AND '.join([f'u.{pk} is not null' for pk in pks[0]])
       outerWindowSpec = Window.partitionBy([f'__operation_flag'] + [f'u.{pk}' for pk in primaryKeys]).orderBy([F.desc(f'u.{pk}') for pk in primaryKeys] + [F.desc(f'staged_updates.{sc}') for sc in sequenceColumns] + [F.expr('(' + ' + '.join([f'CASE WHEN staged_updates.{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]) + ')')])
-      cond = '__rn = 1 AND ' + cond
+      condInitial = '__rn = 1 AND ' + condInitial
       updateCols = {c: F.col(f'staged_updates.__u_{c}') for c in deltaTableColumns}
     else:
       updateCols = {c: F.col(f'staged_updates.{c}') for c in deltaTableColumns}
@@ -698,8 +750,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
       matchCondition = ' AND '.join([f'(u.{sc} is null OR u.{sc} <= staged_updates.{"__u_" if len(pks[1]) > 0 else ""}{sc})' for sc in sequenceColumns])
     else:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.expr('(' + ' + '.join([f'CASE WHEN {c} is not null THEN 0 ELSE 1 END' for c in deltaTableColumns]) + ')')])
-    if outerCond is not None:
-      targetMergeKeyColumns = self._safeMergeLists(primaryKeys, partitionColumns)
+    if outerCondInitial is not None:
+      targetMergeKeyColumns = self._safeMergeLists(primaryKeys, [pc.column() for pc in partitionColumns])
       batchSelect = [F.col(f'staged_updates.{c}').alias(f'__u_{c}') for c in deltaTableColumns] + [F.expr(f'CASE WHEN __operation_flag = 2 THEN staged_updates.{c} WHEN __operation_flag = 1 THEN u.{c} END AS {c}') for c in targetMergeKeyColumns] + [F.when(F.expr('__operation_flag = 1'), F.row_number().over(outerWindowSpec)).otherwise(F.lit(2)).alias('__rn')]
       operationFlag = F.expr(f'CASE WHEN {updateFilter} THEN 1 WHEN {insertFilter} THEN 2 END').alias('__operation_flag')
       nullsCol = F.expr(' + '.join([f'CASE WHEN {pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
@@ -710,10 +762,17 @@ class StreamToStreamJoinWithConditionForEachBatch:
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
       mergeDf = None
-      if outerCond is None:
-        batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
-      else:
-        batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
+      batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
+      cond = condInitial
+      if len(prunedPartitionColumns) > 0:
+        partitionFilter = partitionColumnsExprFunc(batchDf)
+        if partitionFilter is not None and len(partitionFilter) > 0:
+          cond = f'({partitionFilter}) AND ({cond})'
+      outerCond = outerCondInitial
+      if outerCond is not None:
+        if len(prunedPartitionColumns) > 0:
+          if partitionFilter is not None and len(partitionFilter) > 0:
+            outerCond = F.expr(partitionFilter) & outerCond
 #         if 'product_id' in deltaTableColumns:
 #           batchDf.withColumnRenamed('_commit_version', '__commit_version').write.format('delta').mode('overwrite').save('/Users/leon.eller@databricks.com/tmp/error/batch0')
         targetDf = deltaTable.toDF()
