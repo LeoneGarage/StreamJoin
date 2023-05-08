@@ -90,6 +90,97 @@ class StreamToStreamJoin:
 
 # COMMAND ----------
 
+class GroupByWithAggs:
+  _groupBy = None
+  _aggCols = None
+  _stream = None
+  _partitionColumns = None
+  _updateDict = None
+
+  def __init__(self, groupBy, aggCols, updateDict = None):
+    self._groupBy = groupBy
+    self._aggCols = aggCols
+    self._updateDict = updateDict
+    self._stream = groupBy.stream()
+
+  def _doMerge(self, deltaTable, cond, updateCols, insertCols, batchDf, batchId):
+    batchDf = batchDf.groupBy(*self._groupBy.columns()).agg(*self._aggCols).persist(StorageLevel.MEMORY_AND_DISK)
+    mergeChain = deltaTable.alias("u").merge(
+        source = batchDf.alias("staged_updates"),
+        condition = F.expr(cond))
+    mergeChain.whenMatchedUpdate(set = updateCols) \
+        .whenNotMatchedInsert(values = insertCols) \
+        .execute()
+
+  def _writeToTarget(self, deltaTableForFunc, tableName, path):
+    schemaDf = self._stream.stream().groupBy(*self._groupBy.columns()).agg(*self._aggCols)
+    keyCols = schemaDf.columns[:len(self._groupBy.columns())]
+    aggCols = schemaDf.columns[len(self._groupBy.columns()):]
+    if self._updateDict is not None:
+      schemaDf = schemaDf.alias("u").join(schemaDf.alias("staged_updates")).select([f"u.{c}" for c in keyCols + aggCols if c not in self._updateDict] + [(self._updateDict[k][1]).alias(k) for k in self._updateDict])
+    ddl = schemaDf.schema.toDDL()
+    createSql = f'CREATE TABLE IF NOT EXISTS {tableName}({ddl}) USING DELTA'
+    if path is not None:
+      createSql = f"{createSql} LOCATION '{path}'"
+    if self._partitionColumns is not None:
+      createSql = f"{createSql} PARTITIONED BY ({', '.join([pc.column() for pc in self._partitionColumns])})"
+    spark.sql(createSql)
+    cond = " AND ".join([f"u.{kc} = staged_updates.{kc}" for kc in keyCols])
+    updateCols = {ac: F.col(f'u.{ac}') + F.col(f'staged_updates.{ac}') for ac in aggCols}
+    insertCols = {ic: F.col(f'staged_updates.{ic}') for ic in (keyCols + aggCols)}
+    if self._updateDict is not None:
+      for k in self._updateDict:
+        updateCols[k] = self._updateDict[k][1]
+        insertCols[k] = self._updateDict[k][0]
+    def mergeFunc(batchDf, batchId):
+      batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
+      batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
+      deltaTable = deltaTableForFunc()
+      self._doMerge(deltaTable, cond, updateCols, insertCols, batchDf, batchId)
+    return self._stream.stream().writeStream.foreachBatch(mergeFunc)
+
+    # if path is None:
+    #   return Stream.fromTable(tableName)
+    # else:
+    #   return Stream.fromPath(path)
+
+  def partitionBy(self, *columns):
+    self._partitionColumns = [(c if isinstance(c, PartitionColumn) else PartitionColumn(c)) for c in columns]
+    return self
+
+  def reduce(self, column, insert, update):
+    if self._updateDict is None:
+      self._updateDict = {}
+    self._updateDict[column] = (insert, update)
+    return self
+
+  def writeToPath(self, path):
+      return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)
+
+  def writeToTable(self, tableName):
+    return self._writeToTarget(lambda: DeltaTable.forName(spark, tableName), tableName, None)
+
+# COMMAND ----------
+
+class GroupBy:
+  _cols = None
+  _stream = None
+
+  def __init__(self, stream, cols):
+    self._cols = cols
+    self._stream = stream
+
+  def agg(self, *aggCols):
+    return GroupByWithAggs(self, aggCols)
+  
+  def stream(self):
+    return self._stream
+  
+  def columns(self):
+    return self._cols
+
+# COMMAND ----------
+
 class Expression:
   _left = None
   _right = None
@@ -303,6 +394,9 @@ class Stream:
 
   def join(self, right, joinType = 'inner'):
     return StreamToStreamJoin(self, right, joinType)
+  
+  def groupBy(self, *cols):
+    return GroupBy(self, cols)
   
   def to(self, func):
     self._stream = func(self._stream)

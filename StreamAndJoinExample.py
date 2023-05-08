@@ -222,30 +222,39 @@ j = (
 
 # COMMAND ----------
 
-# path = (a.join(b, 'right')
-#   .onKeys('customer_id')).stagingPath()
-# display(DeltaTable.forPath(spark, f'{path}/data').history())
+dbutils.fs.rm(f'{gold_path}/aggs', True)
 
 # COMMAND ----------
 
-# dbutils.fs.rm(f'{checkpointLocation}/test/cp', True)
-# dbutils.fs.rm(f'{silver_path}/test', True)
+b = (
+      Stream.fromPath(f'{silver_path}/transactions')
+      .primaryKeys('transaction_id')
+      .sequenceBy('operation_date')
+    )
 
-# inDf = (
-#          spark.readStream
-# #         .option('ignoreChanges', True)
-#            .option("readChangeFeed", "true")
-#            .format('delta')
-#            .load('/Users/leon.eller@databricks.com/tmp/demo/silver/$$_customers_transactions/right/b72b7fd1451c20a2f17f376784a9a5ad718c0a58fbfe344f642902c191eca371/data')
-#        )
+(
+  b.groupBy("customer_id")
+   .agg(F.sum("amount").alias("amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
+  #  .reduce(column = "avg", insert = F.col("staged_updates.avg"), update = (F.col("u.amount") + F.col("staged_updates.amount")) / (F.col("u.count") + F.col("staged_updates.count")))
+   .writeToPath(f'{gold_path}/aggs')
+   .start()
+)
 
-# inDf = inDf.drop('_change_type', '_commit_timestamp', '_commit_version').where('date = 20220300')
+# COMMAND ----------
 
-# (
-#   inDf.writeStream.format('delta')
-#       .option('checkpointLocation', f'{checkpointLocation}/test/cp')
-#       .start(f'{silver_path}/test')
-# )
+display(spark.sql(f"SELECT customer_id, sum(amount) as amount FROM delta.`{silver_path}/transactions` GROUP BY customer_id ORDER BY amount DESC"))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs` ORDER BY amount DESC
+
+# COMMAND ----------
+
+# path = (a.join(b, 'right')
+#   .onKeys('customer_id')).stagingPath()
+# display(DeltaTable.forPath(spark, f'{path}/data').history())
 
 # COMMAND ----------
 
@@ -349,11 +358,11 @@ print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-display(df.select(df_cols).where("customer_id = '9b977761-628e-486f-a7f8-9433ac1cd0b2' and product_id = '7f60df08-0f03-4e2e-a43f-3b43c1687a15'"))
+# display(df.select(df_cols).where("customer_id = '9b977761-628e-486f-a7f8-9433ac1cd0b2' and product_id = '7f60df08-0f03-4e2e-a43f-3b43c1687a15'"))
 
 # COMMAND ----------
 
-display(cc.select(cc_cols).where("customer_id = '9b977761-628e-486f-a7f8-9433ac1cd0b2' and product_id = '7f60df08-0f03-4e2e-a43f-3b43c1687a15'"))
+# display(cc.select(cc_cols).where("customer_id = '9b977761-628e-486f-a7f8-9433ac1cd0b2' and product_id = '7f60df08-0f03-4e2e-a43f-3b43c1687a15'"))
 
 # COMMAND ----------
 
