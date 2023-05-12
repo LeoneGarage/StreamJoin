@@ -223,6 +223,7 @@ j = (
 # COMMAND ----------
 
 dbutils.fs.rm(f'{gold_path}/aggs', True)
+dbutils.fs.rm(f'{checkpointLocation}/gold/aggs', True)
 
 # COMMAND ----------
 
@@ -235,8 +236,9 @@ b = (
 (
   b.groupBy("customer_id")
    .agg(F.sum("amount").alias("amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
-  #  .reduce(column = "avg", insert = F.col("staged_updates.avg"), update = (F.col("u.amount") + F.col("staged_updates.amount")) / (F.col("u.count") + F.col("staged_updates.count")))
+   .reduce(column = "avg", update = (F.col("u.amount") + F.col("staged_updates.amount")) / (F.col("u.count") + F.col("staged_updates.count")))
    .writeToPath(f'{gold_path}/aggs')
+   .option("checkpointLocation", f'{checkpointLocation}/gold/aggs')
    .start()
 )
 
@@ -246,9 +248,138 @@ display(spark.sql(f"SELECT customer_id, sum(amount) as amount FROM delta.`{silve
 
 # COMMAND ----------
 
+a = (
+      Stream.fromPath(f'{silver_path}/customers')
+        .to(lambda df: df.withColumnRenamed('id', 'customer_id')) # drop duplicate id columns and rename customer's id to customer_id
+        .to(lambda df: df.withColumnRenamed('operation', 'customer_operation')) # drop duplicate operation columns and rename customer's oeration to customer_operation
+        .to(lambda df: df.withColumnRenamed('operation_date', 'customer_operation_date')) # drop duplicate operation_date columns and rename customer's operation_date to customer_operation_date
+        .primaryKeys('customer_id')
+        .sequenceBy('customer_operation_date')
+    )
+
+b = (
+      Stream.fromPath(f'{silver_path}/transactions')
+      .to(lambda df: df.withColumnRenamed('id', 'transaction_id'))
+      .to(lambda df: df.withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100))
+      .primaryKeys('transaction_id')
+      .sequenceBy('operation_date')
+    )
+
+c = (
+      Stream.fromPath(f'{silver_path}/orders')
+            .to(lambda df: df.withColumnRenamed('id', 'order_id'))
+            .to(lambda df: df.withColumnRenamed('operation', 'order_operation'))
+            .to(lambda df: df.withColumnRenamed('operation_date', 'order_operation_date'))
+            .primaryKeys('order_id')
+            .sequenceBy('order_operation_date')
+    )
+
+d = (
+      Stream.fromPath(f'{silver_path}/products')
+            .to(lambda df: df.withColumnRenamed('id', 'product_id'))
+            .to(lambda df: df.withColumnRenamed('item_name', 'product_name'))
+            .to(lambda df: df.withColumnRenamed('order_id', 'product_order_id'))
+            .primaryKeys('product_id')
+            .sequenceBy('item_operation_date')
+    )
+
+j = (
+  a.join(b, 'right')
+  .onKeys('customer_id').partitionBy(prune('date'))
+  .groupBy("customer_id")
+  .agg(F.sum("amount").alias("total_amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
+  .reduce(column = "avg", update = (F.col("u.total_amount") + F.col("staged_updates.total_amount")) / (F.col("u.count") + F.col("staged_updates.count")))
+  .join(b)
+  .onKeys("customer_id")
+  .writeToPath(f'{gold_path}/aggs')
+  .option("checkpointLocation", f'{checkpointLocation}/gold/aggs')
+  .queryName('gold')
+  .start()
+)
+
+# COMMAND ----------
+
+a = (
+      Stream.fromPath(f'{silver_path}/customers')
+        .to(lambda df: df.withColumnRenamed('id', 'customer_id')) # drop duplicate id columns and rename customer's id to customer_id
+        .to(lambda df: df.withColumnRenamed('operation', 'customer_operation')) # drop duplicate operation columns and rename customer's oeration to customer_operation
+        .to(lambda df: df.withColumnRenamed('operation_date', 'customer_operation_date')) # drop duplicate operation_date columns and rename customer's operation_date to customer_operation_date
+        .primaryKeys('customer_id')
+        .sequenceBy('customer_operation_date')
+    )
+
+b = (
+      Stream.fromPath(f'{silver_path}/transactions')
+      .to(lambda df: df.withColumnRenamed('id', 'transaction_id'))
+      .to(lambda df: df.withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100))
+      .primaryKeys('transaction_id')
+      .sequenceBy('operation_date')
+    )
+
+c = (
+      Stream.fromPath(f'{silver_path}/orders')
+            .to(lambda df: df.withColumnRenamed('id', 'order_id'))
+            .to(lambda df: df.withColumnRenamed('operation', 'order_operation'))
+            .to(lambda df: df.withColumnRenamed('operation_date', 'order_operation_date'))
+            .primaryKeys('order_id')
+            .sequenceBy('order_operation_date')
+    )
+
+d = (
+      Stream.fromPath(f'{silver_path}/products')
+            .to(lambda df: df.withColumnRenamed('id', 'product_id'))
+            .to(lambda df: df.withColumnRenamed('item_name', 'product_name'))
+            .to(lambda df: df.withColumnRenamed('order_id', 'product_order_id'))
+            .primaryKeys('product_id')
+            .sequenceBy('item_operation_date')
+    )
+
+j = (
+  a.join(b, 'right')
+  .onKeys('customer_id').partitionBy(prune('date'))
+  .groupBy("customer_id")
+  .agg(F.sum("amount").alias("total_amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
+  .reduce(column = "avg", update = (F.col("u.total_amount") + F.col("staged_updates.total_amount")) / (F.col("u.count") + F.col("staged_updates.count")))
+  .join(b)
+  .onKeys("customer_id")
+  .groupBy("transaction_date")
+  .agg(F.sum("total_amount").alias("total_amount"))
+  .writeToPath(f'{gold_path}/aggs')
+  .option("checkpointLocation", f'{checkpointLocation}/gold/aggs')
+  .queryName('gold')
+  .start()
+)
+
+# COMMAND ----------
+
+aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
+bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id').withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100)
+cc = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
+dd = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name').withColumnRenamed('order_id', 'product_order_id')
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb_g = aa_bb.groupBy("customer_id").agg(F.sum("amount").alias("total_amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
+aa_bb_g_bb = aa_bb_g.join(bb, aa_bb_g['customer_id'] == bb['customer_id']).drop(bb['transaction_id'])
+aa_bb_g_bb_g = aa_bb_g_bb.groupBy("transaction_date").agg(F.sum("total_amount").alias("total_amount"))
+aa_bb_g_bb_g.count()
+
+# COMMAND ----------
+
+df = spark.read.format('delta').load(f'{gold_path}/aggs')
+
+# COMMAND ----------
+
+print(df.select("*").exceptAll(aa_bb_g_bb_g.select("*")).count())
+print(aa_bb_g_bb_g.select("*").exceptAll(df.select("*")).count())
+
+# COMMAND ----------
+
+display(aa_bb_g_bb_g.orderBy(F.desc("total_amount")))
+
+# COMMAND ----------
+
 # MAGIC %sql
 # MAGIC
-# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs` ORDER BY amount DESC
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs` ORDER BY total_amount DESC
 
 # COMMAND ----------
 
