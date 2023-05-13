@@ -140,7 +140,7 @@ class GroupByWithAggs:
         .execute()
 
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
-    schemaDf = self._stream.stream().groupBy(*self._groupBy.columns()).agg(*self._aggCols)
+    schemaDf = self._stream.static().groupBy(*self._groupBy.columns()).agg(*self._aggCols)
     keyCols = schemaDf.columns[:len(self._groupBy.columns())]
     aggCols = schemaDf.columns[len(self._groupBy.columns()):]
     if self._updateDict is not None:
