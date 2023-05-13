@@ -126,8 +126,12 @@ class GroupByWithAggs:
     dir = os.path.dirname(self._stream.path())
     return f'{dir}/{self.generateStagingName()}'
 
-  def _doMerge(self, deltaTable, cond, updateCols, insertCols, batchDf, batchId):
-    batchDf = batchDf.groupBy(*self._groupBy.columns()).agg(*self._aggCols).persist(StorageLevel.MEMORY_AND_DISK)
+  def _doMerge(self, deltaTable, cond, updateCols, insertCols, keyCols, deltaCalcs, batchDf, batchId):
+    batchDf = batchDf.persist(StorageLevel.MEMORY_AND_DISK)
+    plusDf = batchDf.where("_change_type != 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols)
+    minusDf = batchDf.where("_change_type = 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols)
+    batchDf = plusDf.alias("p").join(minusDf.alias("m"), *self._groupBy.columns(), how="left")
+    batchDf = batchDf.select(keyCols + [deltaCalcs[ac] for ac in deltaCalcs])
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
@@ -149,17 +153,19 @@ class GroupByWithAggs:
       createSql = f"{createSql} PARTITIONED BY ({', '.join([pc.column() for pc in self._partitionColumns])})"
     spark.sql(createSql)
     cond = " AND ".join([f"u.{kc} = staged_updates.{kc}" for kc in keyCols])
+    deltaCalcs = {ac: F.expr(f"CASE WHEN m.{ac} is not null THEN p.{ac} - m.{ac} ELSE p.{ac} END as {ac}") for ac in aggCols}
     updateCols = {ac: F.col(f'u.{ac}') + F.col(f'staged_updates.{ac}') for ac in aggCols}
     insertCols = {ic: F.col(f'staged_updates.{ic}') for ic in (keyCols + aggCols)}
     if self._updateDict is not None:
       for k in self._updateDict:
         updateCols[k] = self._updateDict[k][1]
         insertCols[k] = self._updateDict[k][0]
+        deltaCalcs[k] = F.expr(f"CASE WHEN m.{k} is not null THEN {self._updateDict[k][2]} ELSE p.{k} END as {k}")
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
-      self._doMerge(deltaTable, cond, updateCols, insertCols, batchDf, batchId)
+      self._doMerge(deltaTable, cond, updateCols, insertCols, keyCols, deltaCalcs, batchDf, batchId)
     return StreamingQuery(
       (
         self._stream.stream().writeStream.foreachBatch(mergeFunc)
@@ -170,12 +176,16 @@ class GroupByWithAggs:
     self._partitionColumns = [(c if isinstance(c, PartitionColumn) else PartitionColumn(c)) for c in columns]
     return self
 
-  def reduce(self, column, update, insert = None):
+  def reduce(self, column, update, delta_update = None, insert = None):
     if insert is None:
       insert = F.col(f"staged_updates.{column}")
+    if delta_update is None:
+      delta_update = f"p.{column} - m.{column}"
+    if update is None:
+      update = F.col(f'u.{column}') + F.col(f'staged_updates.{column}')
     if self._updateDict is None:
       self._updateDict = {}
-    self._updateDict[column] = (insert, update)
+    self._updateDict[column] = (insert, update, delta_update)
     return self
 
   def join(self, right, joinType = 'inner', stagingPath = None):
@@ -361,7 +371,7 @@ class Stream:
   _path = None
   _name = None
   _isTable = None
-  excludedColumns = ['_commit_version']
+  excludedColumns = ['_commit_version', '_change_type']
 
   def __init__(self,
                stream,
@@ -384,7 +394,8 @@ class Stream:
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.load(path).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
+    cdfStream = cdfStream.load(path)
+    cdfStream = cdfStream.where("_change_type != 'delete'").drop('_commit_timestamp')
     reader = spark.read.format('delta')
     return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).load(path), False).setPath(path)
 
@@ -393,7 +404,8 @@ class Stream:
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
-    cdfStream = cdfStream.table(tableName).where("_change_type != 'update_preimage' and _change_type != 'delete'").drop('_change_type', '_commit_timestamp')
+    cdfStream = cdfStream.table(tableName)
+    cdfStream = cdfStream.where("_change_type != 'delete'").drop('_commit_timestamp')
     reader = spark.read.format('delta')
     return Stream(cdfStream, lambda v: Stream.readAtVersion(reader, v).table(tableName), True).setName(tableName).setPath(tableName)
 
@@ -656,8 +668,8 @@ class StreamingJoin:
     def _mergeJoin(batchDf, batchId):
       nonlocal lastLeftMaxCommitVersion
       nonlocal lastRightMaxCommitVersion
-      left = batchDf.where('left is not null').select('left.*')
-      right = batchDf.where('right is not null').select('right.*')
+      left = batchDf.where("left is not null AND left._change_type != 'update_preimage'").select('left.*')
+      right = batchDf.where("right is not null AND right._change_type != 'update_preimage'").select('right.*')
       maxCommitVersions = (
                                 left.agg(F.max('_commit_version').alias('_left_commit_version'), F.lit(None).alias('_right_commit_version'))
                                     .unionByName(right.agg(F.lit(None).alias('_left_commit_version'), F.max('_commit_version').alias('_right_commit_version')))
@@ -766,6 +778,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if primaryKeys is not None and len(primaryKeys) > 0 and sequenceColumns is not None and len(sequenceColumns) > 0:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
     def mergeTransformFunc(batchDf, batchId):
+      batchDf = batchDf.where("_change_type != 'update_preimage'")
       return mergeFunc(self._dedupBatch(batchDf, windowSpec, primaryKeys), batchId)
     return StreamingJoin(self._left,
                self._right,
@@ -1004,10 +1017,12 @@ class StreamToStreamJoinWithConditionForEachBatch:
     return operationFunc(Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys), joinQuery, joinCondFunc)
 
   def join(self, right, joinType = 'inner', stagingPath = None):
-    return self._createStagingStream(stagingPath, lambda stream, joinQuery, joinCondFunc: stream.join(right, joinType)._chainStreamingQuery(joinQuery, joinCondFunc))
+    return self._createStagingStream(stagingPath,
+                          lambda stream, joinQuery, joinCondFunc: stream.join(right, joinType)._chainStreamingQuery(joinQuery, joinCondFunc))
   
   def groupBy(self, *cols, stagingPath = None):
-    return self._createStagingStream(stagingPath, lambda stream, joinQuery, joinCondFunc: stream.groupBy(*cols)._chainStreamingQuery(joinQuery, joinCondFunc))
+    return self._createStagingStream(stagingPath,
+                          lambda stream, joinQuery, joinCondFunc: stream.groupBy(*cols)._chainStreamingQuery(joinQuery, joinCondFunc))
 
   def writeToPath(self, path):
     return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)

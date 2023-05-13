@@ -244,7 +244,18 @@ b = (
 
 # COMMAND ----------
 
-display(spark.sql(f"SELECT customer_id, sum(amount) as amount FROM delta.`{silver_path}/transactions` GROUP BY customer_id ORDER BY amount DESC"))
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs` ORDER BY amount DESC
+
+# COMMAND ----------
+
+print(spark.sql(f"SELECT customer_id, sum(amount) as amount, count(*) as count, avg(amount) as avg FROM delta.`{silver_path}/transactions` GROUP BY customer_id").exceptAll(spark.sql("SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs`")).count())
+print(spark.sql("SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs`").exceptAll(spark.sql(f"SELECT customer_id, sum(amount) as amount, count(*) as count, avg(amount) as avg FROM delta.`{silver_path}/transactions` GROUP BY customer_id")).count())
+
+# COMMAND ----------
+
+display(spark.sql(f"SELECT customer_id, sum(amount) as amount, count(*) as count, avg(amount) as avg FROM delta.`{silver_path}/transactions` GROUP BY customer_id ORDER BY amount DESC"))
 
 # COMMAND ----------
 
@@ -299,6 +310,27 @@ j = (
 
 # COMMAND ----------
 
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs` ORDER BY total_amount DESC
+
+# COMMAND ----------
+
+aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
+bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id').withColumn('date', F.year(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 10000 + F.month(F.to_date('operation_date', 'MM-dd-yyyy HH:mm:ss')) * 100)
+cc = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
+dd = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name').withColumnRenamed('order_id', 'product_order_id')
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb_g = aa_bb.groupBy("customer_id").agg(F.sum("amount").alias("total_amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
+aa_bb_g_bb = aa_bb_g.join(bb, 'customer_id')
+
+# COMMAND ----------
+
+print(spark.sql(f"SELECT {','.join(aa_bb_g_bb.columns)} FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs`").exceptAll(aa_bb_g_bb).count())
+print(aa_bb_g_bb.exceptAll(spark.sql(f"SELECT {','.join(aa_bb_g_bb.columns)} FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/gold/aggs`")).count())
+
+# COMMAND ----------
+
 a = (
       Stream.fromPath(f'{silver_path}/customers')
         .to(lambda df: df.withColumnRenamed('id', 'customer_id')) # drop duplicate id columns and rename customer's id to customer_id
@@ -339,7 +371,8 @@ j = (
   .onKeys('customer_id').partitionBy(prune('date'))
   .groupBy("customer_id")
   .agg(F.sum("amount").alias("total_amount"), F.avg("amount").alias("avg"), F.count("amount").alias("count"))
-  .reduce(column = "avg", update = (F.col("u.total_amount") + F.col("staged_updates.total_amount")) / (F.col("u.count") + F.col("staged_updates.count")))
+  .reduce(column = "avg",
+     update = (F.col("u.total_amount") + F.col("staged_updates.total_amount")) / (F.col("u.count") + F.col("staged_updates.count")))
   .join(b)
   .onKeys("customer_id")
   .groupBy("transaction_date")
