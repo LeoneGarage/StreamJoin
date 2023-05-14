@@ -166,7 +166,7 @@ class GroupByWithAggs:
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
       self._doMerge(deltaTable, cond, updateCols, insertCols, keyCols, deltaCalcs, batchDf, batchId)
-    return StreamingQuery(
+    return DataStreamWriter(
       (
         self._stream.stream().writeStream.foreachBatch(mergeFunc)
       )
@@ -591,6 +591,77 @@ class MicrobatchJoin:
 class StreamingQuery:
   _streamingQuery = None
   _dependentQuery = None
+
+  def __init__(self,
+               streamingQuery,
+               dependentQuery):
+    self._streamingQuery = streamingQuery
+    self._dependentQuery = dependentQuery
+  
+  @property
+  def lastProgress(self):
+    pdict = {}
+    if self._dependentQuery is not None:
+      pdict.update(self._dependentQuery.lastProgress)
+    pdict[self._streamingQuery.name] = self._streamingQuery.lastProgress
+    return pdict
+
+  @property
+  def recentProgress(self):
+    pdict = {}
+    if self._dependentQuery is not None:
+      pdict.update(self._dependentQuery.recentProgress)
+    pdict[self._streamingQuery.name] = self._streamingQuery.recentProgress
+    return pdict
+
+  @property
+  def isActive(self):
+    if self._dependentQuery is not None:
+      if self._dependentQuery.isActive is True:
+        return True
+    return self._streamingQuery.isActive
+
+  def awaitTermination(self, timeout=None):
+    if self._dependentQuery is not None:
+      self._dependentQuery.awaitTermination(timeout)
+    return self._streamingQuery.awaitTermination(timeout)
+
+  def stop(self):
+    if self._dependentQuery is not None:
+      self._dependentQuery.stop()
+    return self._streamingQuery.stop()
+  
+  def awaitAllProcessed(self):
+    lastBatches = {}
+    maxBytesOutstandingTestRetries = 2
+    testTryCount = 0
+    while(True):
+      lp = self.lastProgress
+      sources = [lp[k]['sources'][0] for k in lp if lp[k] is not None]
+      if len(sources) == len(lp):
+        bytes = [int(s['metrics']['numBytesOutstanding']) if s.get('metrics') is not None else -1 for s in sources]
+        batches = {k: lp[k]['timestamp'] for k in lp}
+        updatedBatches = [batches[bi] for bi in batches if bi in lastBatches and batches[bi] != lastBatches[bi]]
+        if sum(bytes) == 0:
+          if len(updatedBatches) > 0:
+            if testTryCount >= maxBytesOutstandingTestRetries:
+              break
+            else:
+              testTryCount += 1
+        else:
+          testTryCount = 0
+      self.awaitTermination(5)
+      lastBatches.update(batches)
+
+  def awaitAllProcessedAndStop(self):
+    self.awaitAllProcessed()
+    self.stop()
+
+# COMMAND ----------
+
+class DataStreamWriter:
+  _streamingQuery = None
+  _dependentQuery = None
   _upstreamJoinCond = None
 
   def __init__(self,
@@ -612,9 +683,9 @@ class StreamingQuery:
     return self
     
   def trigger(self, availableNow=None, processingTime=None, once=None, continuous=None):
-    self._streamingQuery = self._streamingQuery.trigger(availableNow=availableNow, processingTime=processingTime, once=once, continuous=continuous)
     if self._dependentQuery is not None:
       self._dependentQuery.trigger(availableNow=availableNow, processingTime=processingTime, once=once, continuous=continuous)
+    self._streamingQuery = self._streamingQuery.trigger(availableNow=availableNow, processingTime=processingTime, once=once, continuous=continuous)
     return self
   
   def queryName(self, name):
@@ -626,10 +697,12 @@ class StreamingQuery:
     return self._streamingQuery
 
   def start(self):
+    dq = None
     if self._dependentQuery is not None:
-      self._dependentQuery.start()
+      dq = self._dependentQuery.start()
     spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
-    return self.stream.start()
+    sq = self.stream.start()
+    return StreamingQuery(sq, dq)
 
 class StreamingJoin:
   _left = None
@@ -712,7 +785,7 @@ class StreamingJoin:
            selectCols,
            finalSelectCols):
     packed = self._left.stream().select(F.struct('*').alias('left'), F.lit(None).alias('right')).unionByName(self._right.stream().select(F.lit(None).alias('left'), F.struct('*').alias('right')))
-    return StreamingQuery(
+    return DataStreamWriter(
       (packed
         .writeStream 
         .foreachBatch(self._merge(joinExpr, transformFunc, selectCols, finalSelectCols))
