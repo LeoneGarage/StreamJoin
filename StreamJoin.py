@@ -126,12 +126,12 @@ class GroupByWithAggs:
     dir = os.path.dirname(self._stream.path())
     return f'{dir}/{self.generateStagingName()}'
 
-  def _doMerge(self, deltaTable, cond, updateCols, insertCols, keyCols, deltaCalcs, batchDf, batchId):
+  def _doMerge(self, deltaTable, cond, updateCols, insertCols, keyCols, aggCols, deltaCalcs, batchDf, batchId):
     batchDf = batchDf.persist(StorageLevel.MEMORY_AND_DISK)
-    plusDf = batchDf.where("_change_type != 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols)
-    minusDf = batchDf.where("_change_type = 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols)
-    batchDf = plusDf.alias("p").join(minusDf.alias("m"), *self._groupBy.columns(), how="left")
-    batchDf = batchDf.select(keyCols + [deltaCalcs[ac] for ac in deltaCalcs])
+    plusDf = batchDf.where("_change_type != 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols).alias("p")
+    minusDf = batchDf.where("_change_type = 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols).alias("m")
+    batchDf = plusDf.join(minusDf, F.expr(" AND ".join([f"p.{k} <=> m.{k}" for k in keyCols])), how="left")
+    batchDf = batchDf.select([f"p.{k}" for k in keyCols] + [deltaCalcs[ac] for ac in deltaCalcs])
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
@@ -152,7 +152,7 @@ class GroupByWithAggs:
     if self._partitionColumns is not None:
       createSql = f"{createSql} PARTITIONED BY ({', '.join([pc.column() for pc in self._partitionColumns])})"
     spark.sql(createSql)
-    cond = " AND ".join([f"u.{kc} = staged_updates.{kc}" for kc in keyCols])
+    cond = " AND ".join([f"u.{kc} <=> staged_updates.{kc}" for kc in keyCols])
     deltaCalcs = {ac: F.expr(f"CASE WHEN m.{ac} is not null THEN p.{ac} - m.{ac} ELSE p.{ac} END as {ac}") for ac in aggCols}
     updateCols = {ac: F.col(f'u.{ac}') + F.col(f'staged_updates.{ac}') for ac in aggCols}
     insertCols = {ic: F.col(f'staged_updates.{ic}') for ic in (keyCols + aggCols)}
@@ -165,7 +165,7 @@ class GroupByWithAggs:
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
-      self._doMerge(deltaTable, cond, updateCols, insertCols, keyCols, deltaCalcs, batchDf, batchId)
+      self._doMerge(deltaTable, cond, updateCols, insertCols, keyCols, aggCols, deltaCalcs, batchDf, batchId)
     return DataStreamWriter(
       (
         self._stream.stream().writeStream.foreachBatch(mergeFunc)
@@ -391,7 +391,7 @@ class Stream:
     
   @staticmethod
   def fromPath(path, startingVersion = None):
-    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
+    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true").option("maxBytesPerTrigger", "1g")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
     cdfStream = cdfStream.load(path)
@@ -401,7 +401,7 @@ class Stream:
 
   @staticmethod
   def fromTable(tableName, startingVersion = None):
-    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true")
+    cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true").option("maxBytesPerTrigger", "1g")
     if startingVersion is not None:
       cdfStream.option("startingVersion", "{startingVersion}")
     cdfStream = cdfStream.table(tableName)
@@ -631,20 +631,19 @@ class StreamingQuery:
       self._dependentQuery.stop()
     return self._streamingQuery.stop()
   
-  def awaitAllProcessed(self):
+  def awaitAllProcessed(self, maxConsecutiveNoBytesOutstandingMicrobatchRetries = 6):
     lastBatches = {}
-    maxBytesOutstandingTestRetries = 2
     testTryCount = 0
     while(True):
       lp = self.lastProgress
       sources = [lp[k]['sources'][0] for k in lp if lp[k] is not None]
       if len(sources) == len(lp):
-        bytes = [int(s['metrics']['numBytesOutstanding']) if s.get('metrics') is not None else -1 for s in sources]
+        bytes = [int(s['metrics']['numBytesOutstanding']) if s.get('metrics') is not None else 1 for s in sources]
         batches = {k: lp[k]['timestamp'] for k in lp}
         updatedBatches = [batches[bi] for bi in batches if bi in lastBatches and batches[bi] != lastBatches[bi]]
         if sum(bytes) == 0:
           if len(updatedBatches) > 0:
-            if testTryCount >= maxBytesOutstandingTestRetries:
+            if testTryCount >= maxConsecutiveNoBytesOutstandingMicrobatchRetries:
               break
             else:
               testTryCount += 1

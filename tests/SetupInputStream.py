@@ -217,3 +217,16 @@ def compare_dataframes(resultDf, expectedDf):
 
   print("Passed")
   return True
+
+# COMMAND ----------
+
+def diff(resultDf, expectedDf):
+  result_cols = resultDf.columns
+  result_cols.sort()
+  expected_cols = expectedDf.columns
+  expected_cols.sort()
+
+  t1 = resultDf.select(result_cols).exceptAll(expectedDf.select(expected_cols))
+  t2 = expectedDf.select(expected_cols).exceptAll(resultDf.select(result_cols))
+
+  return t1.select(F.lit("result").alias("_unmatched"), F.col("*")).unionByName(t2.select(F.lit("expected").alias("_unmatched"), F.col("*")))

@@ -43,8 +43,48 @@
 
 # COMMAND ----------
 
+# MAGIC %run "./tests/JoinTestInnerInnerInner"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/JoinTestLeftRightInner"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/JoinTestInnerInnerLeft"
+
+# COMMAND ----------
+
 # MAGIC %run "./tests/JoinTestRightRightLeft"
 
 # COMMAND ----------
 
+# MAGIC %run "./tests/JoinTestLeftInnerRight"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/JoinTestLeftRightLeft"
+
+# COMMAND ----------
+
 # MAGIC %run "./tests/JoinTestComplex1"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/AggsTestGroupBy"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/AggsTestRightGroupBy"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/AggsTestInnerGroupByLeft"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/AggsTestInnerGroupByLeftLeftGroupBy"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/AggsTestRightGroupByInnerGroupBy"
