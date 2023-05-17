@@ -160,7 +160,8 @@ class GroupByWithAggs:
       for k in self._updateDict:
         updateCols[k] = self._updateDict[k][1]
         insertCols[k] = self._updateDict[k][0]
-        deltaCalcs[k] = F.expr(f"CASE WHEN m.{k} is not null THEN {self._updateDict[k][2]} ELSE p.{k} END as {k}")
+        deltaCalcs[k] = F.when(F.col(f"m.{k}").isNotNull(), self._updateDict[k][2]).otherwise(F.col(f"p.{k}")).alias(f"{k}")
+        #  F.expr(f"CASE WHEN m.{k} is not null THEN {self._updateDict[k][2]} ELSE p.{k} END as {k}")
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -180,7 +181,7 @@ class GroupByWithAggs:
     if insert is None:
       insert = F.col(f"staged_updates.{column}")
     if delta_update is None:
-      delta_update = f"p.{column} - m.{column}"
+      delta_update = F.col(f"p.{column}") - F.col(f"m.{column}")
     if update is None:
       update = F.col(f'u.{column}') + F.col(f'staged_updates.{column}')
     if self._updateDict is None:

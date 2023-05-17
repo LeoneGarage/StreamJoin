@@ -88,3 +88,7 @@
 # COMMAND ----------
 
 # MAGIC %run "./tests/AggsTestRightGroupByInnerGroupBy"
+
+# COMMAND ----------
+
+# MAGIC %run "./tests/AggsTestRightGroupByInnerGroupByMax"
