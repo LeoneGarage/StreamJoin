@@ -116,11 +116,11 @@ class GroupByWithAggs:
     return 0
 
   def generateStagingName(self):
-    name = f"$$_{'.'.join([str(c) for c in self._groupBy.columns()])}_{'.'.join([str(c) for c in self._aggCols])}"
+    name = f"{'.'.join([str(c) for c in self._groupBy.columns()])}_{'.'.join([str(c) for c in self._aggCols])}"
     m = hashlib.sha256()
     m.update(name.encode('ascii'))
     m.update(self._stream.path().encode('ascii'))
-    return f'{m.hexdigest()}_{self.stagingIndex()}'
+    return f'$$_agg_{m.hexdigest()}_{self.stagingIndex()}'
 
   def generateStagingPath(self):
     dir = os.path.dirname(self._stream.path())
@@ -1050,7 +1050,9 @@ class StreamToStreamJoinWithConditionForEachBatch:
     return 0
 
   def generateJoinName(self):
-    name = f'$$_{self._left.name()}_{self._right.name()}_{self.stagingIndex()}'
+    name = f'{self._left.name()}_{self._right.name()}_{self.stagingIndex()}'
+    if not name.startswith("$$_"):
+      name = f"$$_{name}"
     m = hashlib.sha256()
     m.update(self._left.path().encode('ascii'))
     m.update(self._right.path().encode('ascii'))
