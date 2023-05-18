@@ -28,3 +28,6 @@ An example in python:
 ```
 Unique primary keys (.primaryKeys()) are required per table for joins to ensure incremental merges have unique keys to merge on.
 Sequence columns (.sequenceBy()) is required to ensure correct ordered processing/merging on rows from CDF.
+To use it put
+```%run "StreamJoin"```
+at the top of your Notebook.
