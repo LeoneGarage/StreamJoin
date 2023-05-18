@@ -1,6 +1,7 @@
 # StreamJoin
 
 A framework for running incremental joins and aggregation over structured streaming CDF feeds from Delta tables.
+So you can have data streaming in from anywhere and landing as tables in Delta in Bronze or Silver layers and then have streaming incremental joins and aggregation happening downstream from that.
 
 An example in python:
 ```
