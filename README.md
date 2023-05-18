@@ -61,4 +61,6 @@ To use it put
 ```%run "StreamJoin"```
 at the top of your Notebook.
 
+![Conceptual Diagram of join and aggregation steps](https://raw.githubusercontent.com/LeoneGarage/StreamJoin/main/StreamJoin.png)
+
 If you want to run tests, run GenerateData Notebook to generate customer, transaction, orders, and products tables first.
