@@ -60,3 +60,5 @@ Sequence columns (.sequenceBy()) is required to ensure correct ordered processin
 To use it put
 ```%run "StreamJoin"```
 at the top of your Notebook.
+
+If you want to run tests, run GenerateData Notebook to generate customer, transaction, orders, and products tables first.
