@@ -87,7 +87,7 @@ j = (
   t.join(c, 'left')
   .onKeys('customer_id')
   .join(o, 'left')
-  .onKeys('customer_id')
+  .onKeys('transaction_id')
   .join(p)
   .onKeys('product_id')
   .groupBy("customer_id")
