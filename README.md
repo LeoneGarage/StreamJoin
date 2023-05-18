@@ -56,7 +56,7 @@ j = (
 )
 ```
 Unique primary keys (.primaryKeys()) are required per table for joins to ensure incremental merges have unique keys to merge on.
-Sequence columns (.sequenceBy()) is required to ensure correct ordered processing/merging on rows from CDF.
+Sequence columns (.sequenceBy()) is optional to ensure correct ordered processing/merging on rows from CDF, with the same primary key, based on order of sequence column, if not provided one of the rows is randomly picked for duplicate primary keys.
 To use it put
 ```%run "StreamJoin"```
 at the top of your Notebook.
