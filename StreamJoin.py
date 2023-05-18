@@ -394,7 +394,7 @@ class Stream:
   def fromPath(path, startingVersion = None):
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true").option("maxBytesPerTrigger", "1g")
     if startingVersion is not None:
-      cdfStream.option("startingVersion", "{startingVersion}")
+      cdfStream = cdfStream.option("startingVersion", f"{startingVersion}")
     cdfStream = cdfStream.load(path)
     cdfStream = cdfStream.where("_change_type != 'delete'").drop('_commit_timestamp')
     reader = spark.read.format('delta')
@@ -404,7 +404,7 @@ class Stream:
   def fromTable(tableName, startingVersion = None):
     cdfStream = spark.readStream.format('delta').option("readChangeFeed", "true").option("maxBytesPerTrigger", "1g")
     if startingVersion is not None:
-      cdfStream.option("startingVersion", "{startingVersion}")
+      cdfStream = cdfStream.option("startingVersion", f"{startingVersion}")
     cdfStream = cdfStream.table(tableName)
     cdfStream = cdfStream.where("_change_type != 'delete'").drop('_commit_timestamp')
     reader = spark.read.format('delta')
