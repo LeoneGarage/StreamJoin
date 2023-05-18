@@ -84,7 +84,7 @@ p = (
     .sequenceBy('product_operation_date')
   )
 j = (
-  t.join(c, 'left')
+  c.join(t, 'right')
   .onKeys('customer_id')
   .join(o, 'left')
   .onKeys('transaction_id')
