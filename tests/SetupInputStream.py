@@ -3,11 +3,8 @@
 
 # COMMAND ----------
 
-# Enable auto compaction and optimized writes in Delta
-spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
-spark.conf.set("spark.databricks.delta.autoCompact.enabled","true")
-spark.conf.set("spark.databricks.delta.properties.defaults.enableChangeDataFeed", True)
-spark.conf.set("spark.databricks.adaptive.autoBroadcastJoinThreshold", "2GB")
+import uuid
+from pyspark.sql import functions as F
 
 # COMMAND ----------
 
@@ -34,16 +31,20 @@ dbutils.fs.rm(gold_path, True)
 
 # COMMAND ----------
 
-spark.sql(f'''
-CREATE TABLE delta.`{silver_path}/transactions` ( amount STRING, customer_id STRING, id STRING, item_count STRING, operation STRING, operation_date STRING, transaction_date STRING) USING delta 
-''')
+spark.sql(
+    f"""
+CREATE TABLE delta.`{silver_path}/transactions` ( amount STRING, customer_id STRING, id STRING, item_count STRING, operation STRING, operation_date STRING, transaction_date STRING) USING delta TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.autoOptimize.autoCompact = true, delta.autoOptimize.optimizeWrite = true)
+"""
+)
 
 # COMMAND ----------
 
-spark.sql(f'''
+spark.sql(
+    f"""
 CREATE TABLE delta.`{silver_path}/customers` ( address STRING, email STRING, firstname STRING, id STRING, lastname STRING, operation STRING, operation_date STRING)
-USING delta
-''')
+USING delta TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.autoOptimize.autoCompact = true, delta.autoOptimize.optimizeWrite = true)
+"""
+)
 
 # COMMAND ----------
 
@@ -53,7 +54,7 @@ id string,
 item_name string,
 operation string,
 operation_date string,
-transaction_id string) USING delta
+transaction_id string) USING delta TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.autoOptimize.autoCompact = true, delta.autoOptimize.optimizeWrite = true)
 ''')
 
 # COMMAND ----------
@@ -65,7 +66,7 @@ item_name STRING,
 item_operation STRING,
 item_operation_date STRING,
 order_id STRING,
-price STRING) USING delta
+price STRING) USING delta TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.autoOptimize.autoCompact = true, delta.autoOptimize.optimizeWrite = true)
 ''')
 
 # COMMAND ----------
@@ -217,16 +218,3 @@ def compare_dataframes(resultDf, expectedDf):
 
   print("Passed")
   return True
-
-# COMMAND ----------
-
-def diff(resultDf, expectedDf):
-  result_cols = resultDf.columns
-  result_cols.sort()
-  expected_cols = expectedDf.columns
-  expected_cols.sort()
-
-  t1 = resultDf.select(result_cols).exceptAll(expectedDf.select(expected_cols))
-  t2 = expectedDf.select(expected_cols).exceptAll(resultDf.select(result_cols))
-
-  return t1.select(F.lit("result").alias("_unmatched"), F.col("*")).unionByName(t2.select(F.lit("expected").alias("_unmatched"), F.col("*")))
