@@ -1,94 +1,30 @@
-# Databricks notebook source
-# MAGIC %run "./tests/JoinTestInner"
+test_notebooks = [
+"./tests/JoinTestInner",
+"./tests/JoinTestRight",
+"./tests/JoinTestLeft",
+"./tests/JoinTestInnerRight",
+"./tests/JoinTestRightInner",
+"./tests/JoinTestInnerLeft",
+"./tests/JoinTestLeftInner",
+"./tests/JoinTestLeftLeft",
+"./tests/JoinTestRightRight",
+"./tests/JoinTestRightLeft",
+"./tests/JoinTestLeftRight",
+"./tests/JoinTestInnerInnerInner",
+"./tests/JoinTestLeftRightInner",
+"./tests/JoinTestInnerInnerLeft",
+"./tests/JoinTestRightRightLeft",
+"./tests/JoinTestLeftInnerRight",
+"./tests/JoinTestLeftRightLeft",
+"./tests/JoinTestComplex1",
+"./tests/AggsTestGroupBy",
+"./tests/AggsTestRightGroupBy",
+"./tests/AggsTestInnerGroupByLeft",
+"./tests/AggsTestInnerGroupByLeftLeftGroupBy",
+"./tests/AggsTestRightGroupByInnerGroupBy",
+"./tests/AggsTestRightGroupByInnerGroupByMax"
+]
 
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestRight"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestInnerRight"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestRightInner"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestInnerLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeftInner"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeftLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestRightRight"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestRightLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeftRight"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestInnerInnerInner"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeftRightInner"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestInnerInnerLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestRightRightLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeftInnerRight"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestLeftRightLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/JoinTestComplex1"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/AggsTestGroupBy"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/AggsTestRightGroupBy"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/AggsTestInnerGroupByLeft"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/AggsTestInnerGroupByLeftLeftGroupBy"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/AggsTestRightGroupByInnerGroupBy"
-
-# COMMAND ----------
-
-# MAGIC %run "./tests/AggsTestRightGroupByInnerGroupByMax"
+for test in test_notebooks:
+    print(f'Running "{test}"')
+    dbutils.notebook.run(test, 0)
