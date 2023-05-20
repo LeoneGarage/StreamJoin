@@ -238,6 +238,7 @@ class StreamingQuery:
   
   def awaitAllProcessed(self, maxConsecutiveNoBytesOutstandingMicrobatchRetries = 6):
     lastBatches = {}
+    batches = {}
     testTryCount = 0
     while(True):
       lp = self.lastProgress
