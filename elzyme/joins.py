@@ -249,6 +249,8 @@ class StreamingJoin:
     lastLeftMaxCommitVersion = None
     lastRightMaxCommitVersion = None
     def _mergeJoin(batchDf, batchId):
+      batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
+      batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       nonlocal lastLeftMaxCommitVersion
       nonlocal lastRightMaxCommitVersion
       left = batchDf.where("left is not null AND left._change_type != 'update_preimage'").select('left.*')
@@ -513,8 +515,6 @@ class StreamToStreamJoinWithConditionForEachBatch:
       stagedNullsCol = F.expr(' + '.join([f'CASE WHEN __u_{pk} is not null THEN 0 ELSE 1 END' for pk in pks[1]]))
       antiJoinCond = F.expr(' AND '.join([f'({outerCondStr})', '((u.__rn != 1 AND (u.__pk_nulls_count > staged_updates.__pk_nulls_count OR u.__u_pk_nulls_count > staged_updates.__u_pk_nulls_count)))', ' AND '.join([f'(u.__u_{pk} <=> staged_updates.__u_{pk} OR u.__u_{pk} is null)' for pk in pks[1]])]))
     def mergeFunc(batchDf, batchId):
-      batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
-      batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
       mergeDf = None
       batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
