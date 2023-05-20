@@ -25,6 +25,10 @@ test_notebooks = [
 "./tests/AggsTestRightGroupByInnerGroupByMax"
 ]
 
+index = 1
 for test in test_notebooks:
-    print(f'Running "{test}"')
-    dbutils.notebook.run(test, 0)
+  print(f'Running Test "{test}", {index} of {len(test_notebooks)}')
+  dbutils.notebook.run(test, 0)
+  index += 1
+
+print(f"{len(test_notebooks)} Tests completed succesfully")
