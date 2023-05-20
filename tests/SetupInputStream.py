@@ -5,10 +5,13 @@
 
 import uuid
 from pyspark.sql import functions as F
+from pathlib import Path
 
 # COMMAND ----------
 
 user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
+path = Path(dbutils.notebook.entry_point.getDbutils().notebook().getContext().extraContext().apply('notebook_path'))
+notebook_name = path.parts[len(path.parts)-1]
 
 # COMMAND ----------
 
