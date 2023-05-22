@@ -242,12 +242,15 @@ class StreamingQuery:
     testTryCount = 0
     while(True):
       lp = self.lastProgress
-      sources = [lp[k]['sources'][0] for k in lp if lp[k] is not None]
+      sources = [lp[k]['sources'] for k in lp if lp[k] is not None]
       if len(sources) == len(lp):
-        bytes = [int(s['metrics']['numBytesOutstanding']) if s.get('metrics') is not None else 1 for s in sources]
+        bytes = [int(s['metrics']['numBytesOutstanding']) if s.get('metrics') is not None else 1 for sarr in sources for s in sarr]
+        startOffsets = [s['startOffset']['reservoirVersion'] if s.get('startOffset') is not None and s['startOffset'].get('reservoirVersion') is not None else 0 for sarr in sources for s in sarr]
+        endOffsets = [s['endOffset']['reservoirVersion'] if s.get('endOffset') is not None and s['endOffset'].get('reservoirVersion') is not None else 0 for sarr in sources for s in sarr]
+        offsets = [o for o in zip(startOffsets, endOffsets) if o[0] != o[1]]
         batches = {k: lp[k]['timestamp'] for k in lp}
-        updatedBatches = [batches[bi] for bi in batches if bi in lastBatches and batches[bi] != lastBatches[bi]]
-        if sum(bytes) == 0:
+        updatedBatches = [batches[bi] for bi in batches if bi not in lastBatches or batches[bi] != lastBatches[bi]]
+        if sum(bytes) == 0 and len(offsets) == 0:
           if len(updatedBatches) > 0:
             if testTryCount >= maxConsecutiveNoBytesOutstandingMicrobatchRetries:
               break
