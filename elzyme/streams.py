@@ -236,7 +236,9 @@ class StreamingQuery:
       self._dependentQuery.stop()
     return self._streamingQuery.stop()
   
-  def awaitAllProcessed(self, maxConsecutiveNoBytesOutstandingMicrobatchRetries = 6):
+  def awaitAllProcessed(self, shutdownLatencySecs = 30):
+    awaitTerminationTimeout = 5
+    maxConsecutiveNoBytesOutstandingMicrobatchRetries = int(shutdownLatencySecs / awaitTerminationTimeout + 0.5)
     lastBatches = {}
     batches = {}
     testTryCount = 0
@@ -258,11 +260,11 @@ class StreamingQuery:
               testTryCount += 1
         else:
           testTryCount = 0
-      self.awaitTermination(5)
+      self.awaitTermination(awaitTerminationTimeout)
       lastBatches.update(batches)
 
-  def awaitAllProcessedAndStop(self):
-    self.awaitAllProcessed()
+  def awaitAllProcessedAndStop(self, shutdownLatencySecs = 30):
+    self.awaitAllProcessed(shutdownLatencySecs)
     self.stop()
 
 class DataStreamWriter:
