@@ -41,18 +41,22 @@ class GroupByWithAggs:
     dir = os.path.dirname(self._stream.path())
     return f'{dir}/{self.generateStagingName()}'
 
-  def _doMerge(self, deltaTable, cond, updateCols, insertCols, keyCols, aggCols, deltaCalcs, batchDf, batchId):
-    batchDf = batchDf.persist(StorageLevel.MEMORY_AND_DISK)
-    plusDf = batchDf.where("_change_type != 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols).alias("p")
-    minusDf = batchDf.where("_change_type = 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols).alias("m")
-    batchDf = plusDf.join(minusDf, F.expr(" AND ".join([f"p.{k} <=> m.{k}" for k in keyCols])), how="left")
+  def _doMerge(self, deltaTable, cond, updateCols, insertCols, keyCols, aggCols, nullAggColsDf, deltaCalcs, batchDf, batchId):
+    plusDf = batchDf.where("_change_type != 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols).alias("p").persist(StorageLevel.MEMORY_AND_DISK)
+    minusDf = batchDf.where("_change_type = 'update_preimage'").groupBy(*self._groupBy.columns()).agg(*self._aggCols).alias("m").persist(StorageLevel.MEMORY_AND_DISK)
+    batchDf = F.broadcast(plusDf).join(minusDf, F.expr(" AND ".join([f"p.{k} <=> m.{k}" for k in keyCols])), how="left")
+    batch_mdf = F.broadcast(minusDf).join(plusDf, F.expr(" AND ".join([f"p.{k} <=> m.{k}" for k in keyCols])), how="left_anti").crossJoin(nullAggColsDf.alias("p"))
     batchDf = batchDf.select([f"p.{k}" for k in keyCols] + [deltaCalcs[ac] for ac in deltaCalcs])
+    batch_mdf = batch_mdf.select([f"m.{k}" for k in keyCols] + [deltaCalcs[ac] for ac in deltaCalcs])
+    batchDf = batchDf.unionByName(batch_mdf)
     mergeChain = deltaTable.alias("u").merge(
         source = batchDf.alias("staged_updates"),
         condition = F.expr(cond))
     mergeChain.whenMatchedUpdate(set = updateCols) \
         .whenNotMatchedInsert(values = insertCols) \
         .execute()
+    plusDf.unpersist()
+    minusDf.unpersist()
 
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
     from elzyme.streams import DataStreamWriter
@@ -69,7 +73,7 @@ class GroupByWithAggs:
       createSql = f"{createSql} PARTITIONED BY ({', '.join([pc.column() for pc in self._partitionColumns])})"
     spark.sql(createSql)
     cond = " AND ".join([f"u.{kc} <=> staged_updates.{kc}" for kc in keyCols])
-    deltaCalcs = {ac: F.expr(f"CASE WHEN m.{ac} is not null THEN p.{ac} - m.{ac} ELSE p.{ac} END as {ac}") for ac in aggCols}
+    deltaCalcs = {ac: F.expr(f"CASE WHEN m.{ac} is not null THEN COALESCE(p.{ac}, 0) - m.{ac} ELSE p.{ac} END as {ac}") for ac in aggCols}
     updateCols = {ac: F.col(f'u.{ac}') + F.col(f'staged_updates.{ac}') for ac in aggCols}
     insertCols = {ic: F.col(f'staged_updates.{ic}') for ic in (keyCols + aggCols)}
     if self._updateDict is not None:
@@ -77,12 +81,12 @@ class GroupByWithAggs:
         updateCols[k] = self._updateDict[k][1]
         insertCols[k] = self._updateDict[k][0]
         deltaCalcs[k] = F.when(F.col(f"m.{k}").isNotNull(), self._updateDict[k][2]).otherwise(F.col(f"p.{k}")).alias(f"{k}")
-        #  F.expr(f"CASE WHEN m.{k} is not null THEN {self._updateDict[k][2]} ELSE p.{k} END as {k}")
+    nullAggColsDf = spark.sql(f"SELECT {','.join([f'null as {a}' for a in aggCols])}")
     def mergeFunc(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
       deltaTable = deltaTableForFunc()
-      self._doMerge(deltaTable, cond, updateCols, insertCols, keyCols, aggCols, deltaCalcs, batchDf, batchId)
+      self._doMerge(deltaTable, cond, updateCols, insertCols, keyCols, aggCols, nullAggColsDf, deltaCalcs, batchDf, batchId)
     return DataStreamWriter(
       (
         self._stream.stream().writeStream.foreachBatch(mergeFunc)
@@ -97,7 +101,7 @@ class GroupByWithAggs:
     if insert is None:
       insert = F.col(f"staged_updates.{column}")
     if delta_update is None:
-      delta_update = F.col(f"p.{column}") - F.col(f"m.{column}")
+      delta_update = F.coalesce(F.col(f"p.{column}"), F.lit(0)) - F.col(f"m.{column}")
     if update is None:
       update = F.col(f'u.{column}') + F.col(f'staged_updates.{column}')
     if self._updateDict is None:
