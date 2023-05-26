@@ -20,11 +20,11 @@ customer_path = f"{root_path}/customers"
 transaction_path = f"{root_path}/transactions"
 orders_path = f"{root_path}/orders"
 products_path = f"{root_path}/products"
-checkpointLocation = f"/Users/{user}/tmp/demo/cp"
+checkpointLocation = f"/Users/{user}/tmp/demo/{notebook_name}/cp"
 schemaLocation = f"/Users/{user}/tmp/demo/schema"
 # bronze_path = f"/Users/{user}/tmp/demo/bronze"
-silver_path = f"/Users/{user}/tmp/demo/silver"
-gold_path = f"/Users/{user}/tmp/demo/gold"
+silver_path = f"/Users/{user}/tmp/demo/{notebook_name}/silver"
+gold_path = f"/Users/{user}/tmp/demo/{notebook_name}/gold"
 
 # COMMAND ----------
 

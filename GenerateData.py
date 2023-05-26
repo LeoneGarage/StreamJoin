@@ -41,77 +41,73 @@ fake_id = F.udf(lambda: str(uuid.uuid4()))
 
 # COMMAND ----------
 
-print("Generating the data...")  
+def generateCustomers():
+  print("Generating Customers...")
+  dbutils.fs.rm(folder+"/customers", True)
 
-df = spark.range(0, numCustomers)
-df = df.withColumn("id", fake_id())
-df = df.withColumn("firstname", fake_firstname())
-df = df.withColumn("lastname", fake_lastname())
-df = df.withColumn("email", fake_email())
-df = df.withColumn("address", fake_address())
-df = df.withColumn("operation", fake_operation())
-df = df.withColumn("operation_date", fake_date())
+  df = spark.range(0, numCustomers)
+  df = df.withColumn("id", fake_id())
+  df = df.withColumn("firstname", fake_firstname())
+  df = df.withColumn("lastname", fake_lastname())
+  df = df.withColumn("email", fake_email())
+  df = df.withColumn("address", fake_address())
+  df = df.withColumn("operation", fake_operation())
+  df = df.withColumn("operation_date", fake_date())
 
-df.repartition(int(numCustomers / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/customers")
+  df.repartition(int(numCustomers / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/customers")
+  print("Generating Customers completed")  
 
-df = spark.range(0, numTransactions)
-df = df.withColumn("id", fake_id())
-df = df.withColumn("transaction_date", fake_date())
-df = df.withColumn("amount", F.round(F.rand()*1000))
-df = df.withColumn("item_count", F.round(F.rand()*10))
-df = df.withColumn("operation", fake_operation())
-df = df.withColumn("operation_date", fake_date())
-#Join with the customer to get the same IDs generated.
-df = df.withColumn("t_id", F.monotonically_increasing_id()).join(spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0).selectExpr("id as customer_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
-df.repartition(int(numTransactions / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/transactions")
+def generateTransactions():
+  print("Generating Transactions...")
+  dbutils.fs.rm(folder+"/transactions", True)
 
-df = spark.range(0, numOrders)
-fake_date_later = F.udf(lambda:fake.date_this_year(before_today=False, after_today=True).strftime("%m-%d-%Y %H:%M:%S"))
-fake_product_name = F.udf(lambda: fake.ecommerce_name())
-df = df.withColumn("id", fake_id())
-df = df.withColumn("delivery_date", fake_date_later())
-df = df.withColumn("item_name", fake_product_name())
-df = df.withColumn("operation", fake_operation())
-df = df.withColumn("operation_date", fake_date())
-transDf = spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = 1.0)
-for c in range(int(numOrders / numTransactions) - 1):
-  transDf = transDf.unionByName(spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = 1.0))
-df = df.withColumn("t_id", F.monotonically_increasing_id()).join(transDf.selectExpr("id as transaction_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
-df.repartition(int(numOrders / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/orders")
+  df = spark.range(0, numTransactions)
+  df = df.withColumn("id", fake_id())
+  df = df.withColumn("transaction_date", fake_date())
+  df = df.withColumn("amount", F.round(F.rand()*1000))
+  df = df.withColumn("item_count", F.round(F.rand()*10))
+  df = df.withColumn("operation", fake_operation())
+  df = df.withColumn("operation_date", fake_date())
+  #Join with the customer to get the same IDs generated.
+  df = df.withColumn("t_id", F.monotonically_increasing_id()).join(spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0).selectExpr("id as customer_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
+  df.repartition(int(numTransactions / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/transactions")
+  print("Generating Transactions completed") 
 
-# COMMAND ----------
+def generateOrders():
+  print("Generating Orders...")
+  dbutils.fs.rm(folder+"/orders", True)
 
-df = spark.range(0, numProducts)
-fake_product_name = F.udf(lambda: fake.ecommerce_name())
-df = df.withColumn("id", fake_id())
-df = df.withColumn("item_name", fake_product_name())
-df = df.withColumn("item_operation", fake_operation())
-df = df.withColumn("item_operation_date", fake_date())
-df = df.withColumn("price", F.round(F.rand()*10))
-ordersDf = spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0)
-for c in range(int(numProducts / numOrders) - 1):
-  ordersDf = ordersDf.unionByName(spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0))
-df = df.withColumn("t_id", F.monotonically_increasing_id()).join(ordersDf.selectExpr("id as order_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
-df.repartition(int(numProducts / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/products")
+  df = spark.range(0, numOrders)
+  fake_date_later = F.udf(lambda:fake.date_this_year(before_today=False, after_today=True).strftime("%m-%d-%Y %H:%M:%S"))
+  fake_product_name = F.udf(lambda: fake.ecommerce_name())
+  df = df.withColumn("id", fake_id())
+  df = df.withColumn("delivery_date", fake_date_later())
+  df = df.withColumn("item_name", fake_product_name())
+  df = df.withColumn("operation", fake_operation())
+  df = df.withColumn("operation_date", fake_date())
+  transDf = spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = 1.0)
+  for c in range(int(numOrders / numTransactions) - 1):
+    transDf = transDf.unionByName(spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = 1.0))
+  df = df.withColumn("t_id", F.monotonically_increasing_id()).join(transDf.selectExpr("id as transaction_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
+  df.repartition(int(numOrders / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/orders")
+  print("Generating Orders completed")
 
 # COMMAND ----------
 
-spark.read.json(folder+"/customers").display()
+def generateProducts():
+  print("Generating Products...")
+  dbutils.fs.rm(folder+"/products", True)
 
-# COMMAND ----------
-
-t = spark.read.json(folder+"/transactions")
-c = spark.read.json(folder+"/customers")
-o = spark.read.json(folder+"/orders")
-p = spark.read.json(folder+"/products")
-
-# COMMAND ----------
-
-j1 = t.join(c, t['customer_id'] == c['id'])
-display(j1.groupBy('customer_id').agg(F.count('*').alias('count')).where('count > 1'))
-
-# COMMAND ----------
-
-#display(t.groupBy('customer_id').agg(F.count('*').alias('count')).where('count > 1'))
-j2 = j1.join(o, t['id'] == p['transaction_id'])
-display(j2.groupBy('transaction_id').agg(F.count('*').alias('count')).where('count > 1'))
+  df = spark.range(0, numProducts)
+  fake_product_name = F.udf(lambda: fake.ecommerce_name())
+  df = df.withColumn("id", fake_id())
+  df = df.withColumn("item_name", fake_product_name())
+  df = df.withColumn("item_operation", fake_operation())
+  df = df.withColumn("item_operation_date", fake_date())
+  df = df.withColumn("price", F.round(F.rand()*10))
+  ordersDf = spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0)
+  for c in range(int(numProducts / numOrders) - 1):
+    ordersDf = ordersDf.unionByName(spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0))
+  df = df.withColumn("t_id", F.monotonically_increasing_id()).join(ordersDf.selectExpr("id as order_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
+  df.repartition(int(numProducts / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/products")
+  print("Generating Products completed")
