@@ -13,9 +13,9 @@ num_parallel_tests = int(dbutils.widgets.get("num_parallel_tests"))
 
 def generateNewData():
   generateCustomers()
-  generateTransactions()
-  generateOrders()
-  generateProducts()
+  generateTransactions(0.8)
+  generateOrders(0.8)
+  generateProducts(0.8)
 
 # COMMAND ----------
 

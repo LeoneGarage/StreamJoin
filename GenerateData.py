@@ -57,7 +57,7 @@ def generateCustomers():
   df.repartition(int(numCustomers / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/customers")
   print("Generating Customers completed")  
 
-def generateTransactions():
+def generateTransactions(fraction = 1.0):
   print("Generating Transactions...")
   dbutils.fs.rm(folder+"/transactions", True)
 
@@ -69,14 +69,14 @@ def generateTransactions():
   df = df.withColumn("operation", fake_operation())
   df = df.withColumn("operation_date", fake_date())
   #Join with the customer to get the same IDs generated.
-  customersDf = spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0)
-  for c in range(int(numTransactions / numCustomers) - 1):
-    customersDf = customersDf.unionByName(spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0))
+  customersDf = spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = fraction)
+  for c in range(int(numTransactions / numCustomers + 0.5) - 1):
+    customersDf = customersDf.unionByName(spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = fraction))
   df = df.withColumn("t_id", F.monotonically_increasing_id()).join(customersDf.selectExpr("id as customer_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
   df.repartition(int(numTransactions / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/transactions")
   print("Generating Transactions completed") 
 
-def generateOrders():
+def generateOrders(fraction = 1.0):
   print("Generating Orders...")
   dbutils.fs.rm(folder+"/orders", True)
 
@@ -88,16 +88,16 @@ def generateOrders():
   df = df.withColumn("item_name", fake_product_name())
   df = df.withColumn("operation", fake_operation())
   df = df.withColumn("operation_date", fake_date())
-  transDf = spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = 1.0)
-  for c in range(int(numOrders / numTransactions) - 1):
-    transDf = transDf.unionByName(spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = 1.0))
+  transDf = spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = fraction)
+  for c in range(int(numOrders / numTransactions + 0.5) - 1):
+    transDf = transDf.unionByName(spark.read.json(folder+"/transactions").sample(withReplacement = True, fraction = fraction))
   df = df.withColumn("t_id", F.monotonically_increasing_id()).join(transDf.selectExpr("id as transaction_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
   df.repartition(int(numOrders / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/orders")
   print("Generating Orders completed")
 
 # COMMAND ----------
 
-def generateProducts():
+def generateProducts(fraction = 1.0):
   print("Generating Products...")
   dbutils.fs.rm(folder+"/products", True)
 
@@ -108,9 +108,9 @@ def generateProducts():
   df = df.withColumn("item_operation", fake_operation())
   df = df.withColumn("item_operation_date", fake_date())
   df = df.withColumn("price", F.round(F.rand()*10))
-  ordersDf = spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0)
-  for c in range(int(numOrders / numProducts) - 1):
-    ordersDf = ordersDf.unionByName(spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0))
+  ordersDf = spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = fraction)
+  for c in range(int(numOrders / numProducts + 0.5) - 1):
+    ordersDf = ordersDf.unionByName(spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = fraction))
   df = df.withColumn("t_id", F.monotonically_increasing_id()).join(ordersDf.selectExpr("id as order_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
   df.repartition(int(numProducts / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/products")
   print("Generating Products completed")
