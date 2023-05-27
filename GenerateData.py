@@ -19,10 +19,10 @@ import uuid
 from functools import reduce
 
 numCustomers = 1000000
-numTransactions = 500000
-numOrders = 5000000
-rowsPerPartition = 10000
-numProducts = 50000000
+numTransactions = 5000000
+numOrders = 2000000
+rowsPerPartition = 5000
+numProducts = 500000
 
 folder = f"/Users/{user}/tmp/demo/cdc_raw"
 
@@ -69,7 +69,10 @@ def generateTransactions():
   df = df.withColumn("operation", fake_operation())
   df = df.withColumn("operation_date", fake_date())
   #Join with the customer to get the same IDs generated.
-  df = df.withColumn("t_id", F.monotonically_increasing_id()).join(spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0).selectExpr("id as customer_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
+  customersDf = spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0)
+  for c in range(int(numTransactions / numCustomers) - 1):
+    customersDf = customersDf.unionByName(spark.read.json(folder+"/customers").sample(withReplacement = True, fraction = 1.0))
+  df = df.withColumn("t_id", F.monotonically_increasing_id()).join(customersDf.selectExpr("id as customer_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
   df.repartition(int(numTransactions / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/transactions")
   print("Generating Transactions completed") 
 
@@ -106,7 +109,7 @@ def generateProducts():
   df = df.withColumn("item_operation_date", fake_date())
   df = df.withColumn("price", F.round(F.rand()*10))
   ordersDf = spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0)
-  for c in range(int(numProducts / numOrders) - 1):
+  for c in range(int(numOrders / numProducts) - 1):
     ordersDf = ordersDf.unionByName(spark.read.json(folder+"/orders").sample(withReplacement = True, fraction = 1.0))
   df = df.withColumn("t_id", F.monotonically_increasing_id()).join(ordersDf.selectExpr("id as order_id").withColumn("t_id", F.monotonically_increasing_id()), "t_id").drop("t_id")
   df.repartition(int(numProducts / rowsPerPartition)).write.format("json").mode("overwrite").save(folder+"/products")
