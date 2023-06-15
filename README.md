@@ -100,6 +100,6 @@ j = (
 ```
 ![Conceptual Diagram of join and aggregation steps](https://raw.githubusercontent.com/LeoneGarage/StreamJoin/main/StreamJoin.png)
 Each 2 way join and aggregation outputs an intermediate Delta table of that join or aggregation and CDF stream from that table is used as input into the following join or aggregation, except for the last one which writes out the resulting Delta table.
-The joins and aggregations are done incrementally for each streaming microbatch. The microbatch readStream is specified maxBytesPerTrigger of 1GB to ensure each microbatch can be broadcast for the join thereby avoiding shuffle where possible and ensuring file and partition pruning taking effect for joins.
+The joins and aggregations are done incrementally for each streaming microbatch. The microbatch readStream is configured with maxBytesPerTrigger option of 1GB to ensure each microbatch can be broadcast for the join thereby avoiding shuffle where possible and ensuring file and partition pruning taking effect for joins.
 
 You can run tests by running RunTests Notebook. Each new run uses functions in GenerateData Notebook to generate new customer, transaction, orders, and products tables first.
