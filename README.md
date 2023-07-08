@@ -1,7 +1,9 @@
 # StreamJoin
+Spark Structured Streaming stream to stream joins and aggregations can be complicated to reason about and implement. In addition, you need to take into account watermarks to ensure streaming state is cleaned up appropriately and avoid runaway state growth.
+However, if we land streaming data in Delta tables first, we can then use Change Data Feed (CDF) to perform incremental stream to stream joins and incremental aggregations without needing watermarks and reducing complexity in reasoning about these operations. This framework provides an API which looks like a familiar pyspark dataframe API, and implements such capability. Using standard Databricks Delta Medallion architecture, you can start by landing streaming data in bronze a table at a time and then perform incremental joins and aggregations downstream in silver and/or gold tables.
 
-A framework for running incremental joins and aggregation over structured streaming CDF feeds from Delta tables.
-Allows you to have data streaming in from anywhere and landing as tables in Databricks Delta and then have streaming incremental joins and aggregation happening downstream from Delta Bronze or Silver layers.
+StreamJoin is a framework for running incremental joins and aggregation over structured streaming CDF feeds from Delta tables.
+It allows you to have data streaming in from anywhere and landing as tables in Databricks Delta and then have streaming incremental joins and aggregation happening downstream from Delta Bronze or Silver layers.
 
 An example in python:
 ```
