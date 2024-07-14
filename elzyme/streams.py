@@ -23,7 +23,9 @@ class ColumnSelector:
     return self._stream
 
   def stream(self):
-    return self._stream.stream()
+    if self._stream is not None:
+      return self._stream.stream()
+    return None
 
   def columnName(self):
     return self._columnName
@@ -32,6 +34,9 @@ class ColumnSelector:
     if self._func is None:
       return col
     return self._func(col)
+
+  def alias(self, newName):
+    return self.to(lambda c: c.alias(newName))
 
   def to(self, func):
     self._func = func
@@ -52,6 +57,12 @@ class ColumnSelector:
 
   def __and__(self, other):
     return ColumnRef(self) & other
+
+  def __or__(self, other):
+    return ColumnRef(self) | other
+  
+  def __repr__(self):
+    return f"ColumnSelector('{self._columnName}')"
 
 class PartitionColumn:
   _column = None

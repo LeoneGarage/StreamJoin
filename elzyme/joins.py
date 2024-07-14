@@ -10,6 +10,128 @@ import hashlib
 import itertools
 import elzyme.utils
 
+class Selector:
+  _left = None
+  _right = None
+  _joinType = None
+  _joinExpr = None
+  _transformFunc = None
+
+  def __init__(self,
+               left,
+               right,
+               joinType,
+               onCondition,
+               transformFunc):
+    self._left = left
+    self._right = right
+    self._joinType = joinType
+    self._joinExpr = onCondition
+    self._transformFunc = transformFunc
+
+  def _selectColumns(self, leftCols, rightCols):
+    from elzyme.streams import ColumnSelector
+    leftStatic = self._left.static().select([c.columnName() for c in leftCols])
+    rightStatic = self._right.static().select([c.columnName() for c in rightCols])
+    schemaDf = leftStatic.join(rightStatic, self._joinExpr(leftStatic, rightStatic), self._joinType)
+    if self._transformFunc is not None:
+      schemaDf = self._transformFunc(schemaDf, leftStatic, rightStatic)
+    def getNewColumns(joinedDf, left, right):
+      halfDf = joinedDf
+      for k in left.columns:
+        halfDf = halfDf.drop(left[k])
+      for k in right.columns:
+        halfDf = halfDf.drop(right[k])
+      return halfDf
+    def getColumns(joinedDf, oneSideDf, newColumnDf):
+      halfDf = joinedDf
+      for k in oneSideDf.columns:
+        halfDf = halfDf.drop(oneSideDf[k])
+      for k in newColumnDf.columns:
+        halfDf = halfDf.drop(newColumnDf[k])
+      return halfDf
+    newColumns = getNewColumns(schemaDf, leftStatic, rightStatic)
+    return [ColumnSelector(self._left, c) for c in getColumns(schemaDf, rightStatic, newColumns).columns] + [ColumnSelector(self._right, c) for c in getColumns(schemaDf, leftStatic, newColumns).columns] + [ColumnSelector(None, c) for c in newColumns.columns]
+    # return [ColumnSelector(self._left, c) for c in leftStatic.columns] + [ColumnSelector(self._right, c) for c in rightStatic.columns] + [ColumnSelector(None, c) for c in getColumns(schemaDf, leftStatic, rightStatic).columns]
+    # return [ColumnSelector(self._left, c) for c in getColumns(schemaDf, rightStatic).columns] + [ColumnSelector(self._right, c) for c in getColumns(schemaDf, leftStatic).columns]
+
+  def select(self, *selectCols):
+    from elzyme.streams import ColumnSelector
+    if isinstance(selectCols[0], ColumnSelector):
+      leftDict = {}
+      rightDict = {}
+      expandedCols = []
+      for c in selectCols:
+        if c.columnName() == '*':
+          if c.stream() is self._left.stream():
+            for col in self._left.columns():
+              expandedCols.append(ColumnSelector(self._left, col))
+          elif c.stream() is self._right.stream():
+            for col in self._right.columns():
+              expandedCols.append(ColumnSelector(self._right, col))
+        else:
+          expandedCols.append(c)
+      selectCols = tuple(expandedCols)
+      for c in selectCols:
+        if c.stream() is self._left.stream():
+          leftDict[c.columnName()] = c.columnName()
+        elif c.stream() is self._right.stream():
+          rightDict[c.columnName()] = c.columnName()
+      def selectCol(c):
+        cn = c.columnName()
+        lc = leftDict.get(cn)
+        if lc is not None:
+          return lambda f, l, r: l[cn]
+        else:
+          lc = rightDict.get(cn)
+          if lc is not None:
+            return lambda f, l, r: r[cn]
+        return lambda f, l, r: f[cn]
+      def finalSelectCol(c):
+        cn = c.columnName()
+        lc = leftDict.get(cn)
+        if lc is not None:
+          return lambda f, l, r: c.transform(l[cn])
+        else:
+          lc = rightDict.get(cn)
+          if lc is not None:
+            return lambda f, l, r: c.transform(r[cn])
+        return lambda f, l, r: c.transform(f[cn])
+      def get_distinct(selCols):
+        class Ref(object):
+          def __init__(self, value):
+            self.value = value
+          def __eq__(self, other):
+            return self.value is other.value
+          def __hash__(self):
+            return id(self.value)
+        col_set = set()
+        for c in selCols:
+          if (Ref(c.stream()), c.columnName()) not in col_set:
+            col_set.add((Ref(c.stream()), c.columnName()))
+            yield c
+      selectFuncs = [selectCol(c) for c in get_distinct(selectCols)]
+      selectFunc = lambda j, l, r: [f(j, l, r) for f in selectFuncs]
+      finalSelectFuncs = [finalSelectCol(c) for c in selectCols]
+      finalSelectFunc = lambda j, l, r: [f(j, l, r) for f in finalSelectFuncs]
+    else:
+      from elzyme.streams import ColumnSelector
+      if isinstance(selectCols, tuple):
+        # if '*' is specified convert to columns from left and right minus primary keys on right to avoid dups
+        leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.columns()] for c in selectCols if c == '*']
+        rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.columns()] for c in selectCols if c == '*']
+        leftCols = [lc for arr in leftStars for lc in arr]
+        rightCols = [lc for arr in rightStars for lc in arr]
+        allCols = self._selectColumns(leftCols, rightCols)
+        if len(allCols) > 0:
+          return self.select(*allCols)
+        else:
+          return self.select(*([ColumnSelector(self._left, lc) for lc in self._left.columns() if lc in selectCols] + [ColumnSelector(self._right, lc) for lc in self._right.columns() if lc in selectCols]))
+      else:
+        selectFunc = selectCols
+        finalSelectFunc = selectFunc
+    return (selectFunc, finalSelectFunc)
+
 class StreamToStreamJoin:
   _left = None
   _right = None
@@ -50,6 +172,7 @@ class StreamToStreamJoin:
  
   def onKeys(self, *keys):
     joinExpr = lambda l, r: reduce(lambda c, e: c & e, [(l[k] == r[k]) for k in keys])
+    # joinExpr = lambda l, r: [k for k in keys]
     def dropRight(f, l, r):
       for k in keys:
         f = f.drop(r[k])
@@ -65,7 +188,7 @@ class StreamToStreamJoin:
     return StreamToStreamJoinWithCondition(self._left,
                self._right,
                self._joinType,
-               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond).to(func)
+               joinExpr)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)._map(func)
 
 class Expression:
   _left = None
@@ -170,9 +293,9 @@ class MicrobatchJoin:
       selectFunc = lambda f, l, r: f.selectExpr(*selectCols)
       finalSelectFunc = lambda f, l, r: f.selectExpr(*selectCols)
     else:
-      dropDupKeys = lambda func, f, l, r: f
-      selectFunc = lambda f, l, r: f.select(*selectCols(l, r))
-      finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(l, r))
+      dropDupKeys = MicrobatchJoin._transform #lambda func, f, l, r: f
+      selectFunc = lambda f, l, r: f.select(*selectCols(f, l, r))
+      finalSelectFunc = lambda f, l, r: f.select(*finalSelectCols(f, l, r))
 
     newLeft = F.broadcast(self._leftMicrobatch).join(self._rightStatic, joinExpr(self._leftMicrobatch, self._rightStatic), 'left' if joinType == 'left' else 'inner')
     newLeft = dropDupKeys(transformFunc, newLeft, self._leftMicrobatch, self._rightStatic)
@@ -196,8 +319,12 @@ class MicrobatchJoin:
     else:
       filter = [((newLeft[pk].isNotNull() & newRight[pk].isNotNull()) | (newLeft[pk].isNull() & newRight[pk].isNull())) for pk in primaryKeys]
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, filter))
-    both = dropDupKeys(transformFunc, both, newLeft, newRight)
-    both = selectFunc(both, newLeft, newRight)
+    both = both.select([F.coalesce(newLeft[c], newRight[c]).alias(c) for c in newLeft.columns])
+    both = dropDupKeys(transformFunc,
+                      both, newLeft, newRight)
+    both = selectFunc(both,
+                      both,#newLeft,
+                      both)#newRight)
     unionDf = left.unionByName(right).unionByName(both)
     unionDf = unionDf.where(reduce(lambda e, pk: e | pk, [unionDf[pk].isNotNull() for pk in primaryKeys]))
     finalDf = finalSelectFunc(unionDf, unionDf, unionDf)
@@ -316,6 +443,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
   _finalSelectCols = None
   _dependentQuery = None
   _upstreamJoinCond = None
+  _stream = None
 
   def __init__(self,
                left,
@@ -325,7 +453,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
                transformFunc,
                partitionColumns,
                selectCols,
-               finalSelectCols):
+               finalSelectCols,
+               stream = None):
     self._left = left
     self._right = right
     self._joinType = joinType
@@ -334,6 +463,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     self._partitionColumns = partitionColumns
     self._selectCols = selectCols
     self._finalSelectCols = finalSelectCols
+    self._stream = stream
   
   def _chainStreamingQuery(self, dependentQuery, upstreamJoinCond):
     self._dependentQuery = dependentQuery
@@ -350,6 +480,30 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if a is not None:
       a = list(dict.fromkeys(a))
     return a
+
+  def _map(self, func):
+    if self._transformFunc is not None:
+      tFunc = self._transformFunc
+      newFunc = lambda f, l, r: func(tFunc(f, l, r), l, r)
+    else:
+      newFunc = func
+    return StreamToStreamJoinWithConditionForEachBatch(
+               self._left,
+               self._right,
+               self._joinType,
+               self._joinExpr,
+               newFunc,
+               self._partitionColumns,
+               self._selectCols,
+               self._finalSelectCols,
+               self._stream)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
+
+  def to(self, func):
+    return self._map(lambda f, l, r: func(f))
+
+  def __getitem__(self, key):
+    from elzyme.streams import ColumnSelector
+    return ColumnSelector(self._stream, key)
 
   def partitionBy(self, *columns):
     from elzyme.streams import PartitionColumn
@@ -388,6 +542,18 @@ class StreamToStreamJoinWithConditionForEachBatch:
     mergeChain.whenMatchedUpdate(condition = matchCondition, set = updateCols) \
         .whenNotMatchedInsert(values = updateCols) \
         .execute()
+
+  def select(self, *selectCols):
+    (selectFunc, finalSelectFunc) = Selector(self._left, self._right, self._joinType, self._joinExpr, self._transformFunc).select(*selectCols)
+    return StreamToStreamJoinWithConditionForEachBatch(self._left,
+               self._right,
+               self._joinType,
+               self._joinExpr,
+               self._transformFunc,
+               self._partitionColumns,
+               selectFunc,
+               finalSelectFunc,
+               self._stream)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
   def _mergeCondition(self, nonNullableKeys, nullableKeys, extraCond = ''):
     arr = []
@@ -442,11 +608,10 @@ class StreamToStreamJoinWithConditionForEachBatch:
   def _writeToTarget(self, deltaTableForFunc, tableName, path):
     leftStatic = self._left.static()
     rightStatic = self._right.static()
-    schemaDf = leftStatic.join(rightStatic,
-                                                   self._joinExpr(leftStatic, rightStatic))
+    schemaDf = leftStatic.join(rightStatic, self._joinExpr(leftStatic, rightStatic), self._joinType)
     if self._transformFunc is not None:
       schemaDf = self._transformFunc(schemaDf, leftStatic, rightStatic)
-    schemaDf = schemaDf.select(self._finalSelectCols(leftStatic, rightStatic))
+    schemaDf = schemaDf.select(self._finalSelectCols(schemaDf, leftStatic, rightStatic))
     ddl = schemaDf.schema.toDDL()
     createSql = f'CREATE TABLE IF NOT EXISTS {tableName}({ddl}) USING DELTA TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.autoOptimize.autoCompact = true, delta.autoOptimize.optimizeWrite = true)'
     if path is not None:
@@ -600,7 +765,14 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = func
     else:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
-    return operationFunc(Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys), joinQuery, joinCondFunc)
+    self._stream = Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
+    return operationFunc(self._stream, joinQuery, joinCondFunc)
+
+  def _union(self, other_df):
+    return self.to(lambda s: s.union(other_df))
+
+  def union(self, other):
+    return other.to(lambda o: self._union(o))
 
   def join(self, right, joinType = 'inner', stagingPath = None):
     return self._createStagingStream(stagingPath,
@@ -645,7 +817,7 @@ class StreamToStreamJoinWithCondition:
     self._upstreamJoinCond = upstreamJoinCond
     return self
 
-  def _to(self, func):
+  def _map(self, func):
     if self._transformFunc is not None:
       tFunc = self._transformFunc
       newFunc = lambda f, l, r: func(tFunc(f, l, r), l, r)
@@ -658,20 +830,6 @@ class StreamToStreamJoinWithCondition:
                newFunc,
                self._partitionColumns)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
   
-  def _selectColumns(self, leftCols, rightCols):
-    from elzyme.streams import ColumnSelector
-    leftStatic = self._left.static().select([c.columnName() for c in leftCols])
-    rightStatic = self._right.static().select([c.columnName() for c in rightCols])
-    schemaDf = leftStatic.join(rightStatic, self._joinExpr(leftStatic, rightStatic))
-    if self._transformFunc is not None:
-      schemaDf = self._transformFunc(schemaDf, leftStatic, rightStatic)
-    def getColumns(joinedDf, oneSideDf):
-      halfDf = joinedDf
-      for k in oneSideDf.columns:
-        halfDf = halfDf.drop(oneSideDf[k])
-      return halfDf
-    return [ColumnSelector(self._left, c) for c in getColumns(schemaDf, rightStatic).columns] + [ColumnSelector(self._right, c) for c in getColumns(schemaDf, leftStatic).columns]
-
   def stagingPath(self):
     return self.select('*').generateJoinStagingPath()
 
@@ -683,10 +841,10 @@ class StreamToStreamJoinWithCondition:
       func = lambda f, l, r: f.drop(r[column.columnName()])
     else:
       func = lambda f, l, r: f.drop(l[column.columnName()])
-    return self.to(func)
+    return self._map(func)
 
-  def to(self, func):
-    return self._to(func)
+  # def map(self, func):
+  #   return self._map(func)
 
   def join(self, right, joinType = 'inner', stagingPath = None):
     return self.select('*').join(right, joinType, stagingPath)
@@ -704,56 +862,7 @@ class StreamToStreamJoinWithCondition:
     return self.select('*').writeToTable(tableName)
     
   def select(self, *selectCols):
-    from elzyme.streams import ColumnSelector
-    if isinstance(selectCols[0], ColumnSelector):
-      leftDict = {}
-      expandedCols = []
-      for c in selectCols:
-        if c.columnName() == '*':
-          if c.stream() is self._left.stream():
-            for col in self._left.columns():
-              expandedCols.append(ColumnSelector(self._left, col))
-          elif c.stream() is self._right.stream():
-            for col in self._right.columns():
-              expandedCols.append(ColumnSelector(self._right, col))
-        else:
-          expandedCols.append(c)
-      selectCols = tuple(expandedCols)
-      for c in selectCols:
-        if c.stream() is self._left.stream():
-          leftDict[c.columnName()] = c.columnName()
-      def selectCol(c):
-        cn = c.columnName()
-        lc = leftDict.get(cn)
-        if lc is not None:
-          return lambda l, r: l[cn]
-        return lambda l, r: r[cn]
-      def finalSelectCol(c):
-        cn = c.columnName()
-        lc = leftDict.get(cn)
-        if lc is not None:
-          return lambda l, r: c.transform(l[cn])
-        return lambda l, r: c.transform(r[cn])
-      selectFuncs = [selectCol(c) for c in selectCols]
-      selectFunc = lambda l, r: [f(l, r) for f in selectFuncs]
-      finalSelectFuncs = [finalSelectCol(c) for c in selectCols]
-      finalSelectFunc = lambda l, r: [f(l, r) for f in finalSelectFuncs]
-    else:
-      from elzyme.streams import ColumnSelector
-      if isinstance(selectCols, tuple):
-        # if '*' is specified convert to columns from left and right minus primary keys on right to avoid dups
-        leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.columns()] for c in selectCols if c == '*']
-        rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.columns()] for c in selectCols if c == '*']
-        leftCols = [lc for arr in leftStars for lc in arr]
-        rightCols = [lc for arr in rightStars for lc in arr]
-        allCols = self._selectColumns(leftCols, rightCols)
-        if len(allCols) > 0:
-          return self.select(*allCols)
-        else:
-          return self.select(*([ColumnSelector(self._left, lc) for lc in self._left.columns() if lc in selectCols] + [ColumnSelector(self._right, lc) for lc in self._right.columns() if lc in selectCols]))
-      else:
-        selectFunc = selectCols
-        finalSelectFunc = selectFunc
+    (selectFunc, finalSelectFunc) = Selector(self._left, self._right, self._joinType, self._joinExpr, self._transformFunc).select(*selectCols)
     return StreamToStreamJoinWithConditionForEachBatch(self._left,
                self._right,
                self._joinType,
