@@ -512,13 +512,16 @@ class StreamToStreamJoinWithConditionForEachBatch:
 
   def foreachBatch(self, mergeFunc):
     windowSpec = None
+    windowSpec2 = None
     primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
     sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
-    if primaryKeys is not None and len(primaryKeys) > 0 and sequenceColumns is not None and len(sequenceColumns) > 0:
+    if sequenceColumns is not None and len(sequenceColumns) > 0:
       windowSpec = Window.partitionBy(primaryKeys).orderBy([F.desc(sc) for sc in sequenceColumns])
+    else:
+      windowSpec2 = Window.partitionBy(primaryKeys).orderBy(F.desc("_commit_version"))
     def mergeTransformFunc(batchDf, batchId):
       batchDf = batchDf.where("_change_type != 'update_preimage'")
-      return mergeFunc(self._dedupBatch(batchDf, windowSpec, primaryKeys), batchId)
+      return mergeFunc(self._dedupBatch(batchDf, windowSpec, windowSpec2, primaryKeys), batchId)
     return StreamingJoin(self._left,
                self._right,
                self._joinType,
@@ -527,11 +530,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
                                self._selectCols,
                                self._finalSelectCols)._chainStreamingQuery(self._dependentQuery, self._upstreamJoinCond)
 
-  def _dedupBatch(self, batchDf, windowSpec, primaryKeys):
+  def _dedupBatch(self, batchDf, windowSpec, windowSpec2, primaryKeys):
     if windowSpec is not None:
       batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
     else:
-      batchDf = batchDf.dropDuplicates(primaryKeys)
+      batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec2)).where('__row_number = 1').dropDuplicates(primaryKeys)
     return batchDf
 
   def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, batchDf, batchId):
@@ -682,7 +685,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     def mergeFunc(batchDf, batchId):
       deltaTable = deltaTableForFunc()
       mergeDf = None
-      batchDf = self._dedupBatch(batchDf, windowSpec, primaryKeys)
+      batchDf = self._dedupBatch(batchDf, windowSpec, None, primaryKeys)
       cond = condInitial
       if len(prunedPartitionColumns) > 0:
         partitionFilter = partitionColumnsExprFunc(batchDf)
