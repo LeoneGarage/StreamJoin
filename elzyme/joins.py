@@ -375,6 +375,14 @@ class StreamingJoin:
     mergeFunc = self._mergeFunc
     lastLeftMaxCommitVersion = None
     lastRightMaxCommitVersion = None
+    row_number_left = F.row_number().over(Window.partitionBy(*self._left.getPrimaryKeys()).orderBy(F.desc("_commit_version")))
+    row_number_right = F.row_number().over(Window.partitionBy(*self._right.getPrimaryKeys()).orderBy(F.desc("_commit_version")))
+    left_commit_dedup = None
+    if self._left.getSequenceColumns() is None or len(self._left.getSequenceColumns()) <= 0:
+      left_commit_dedup = lambda df: df.withColumn('__row_number', row_number_left).where('__row_number = 1').drop('__row_number')
+    right_commit_dedup = None
+    if self._right.getSequenceColumns() is None or len(self._right.getSequenceColumns()) <= 0:
+      right_commit_dedup = lambda df: df.withColumn('__row_number', row_number_right).where('__row_number = 1').drop('__row_number')
     def _mergeJoin(batchDf, batchId):
       batchDf._jdf.sparkSession().conf().set('spark.databricks.optimizer.adaptive.enabled', True)
       batchDf._jdf.sparkSession().conf().set('spark.sql.adaptive.forceApply', True)
@@ -408,6 +416,11 @@ class StreamingJoin:
         rightStaticLocal = self._right.static(rightMaxCommitVersion)
       lastLeftMaxCommitVersion = leftMaxCommitVersion
       lastRightMaxCommitVersion = rightMaxCommitVersion
+      # Ensure we take the latest commit version of each row
+      if left_commit_dedup is not None:
+        left = left_commit_dedup(left)
+      if right_commit_dedup is not None:
+        right = right_commit_dedup(right)
       with MicrobatchJoin(left, leftStaticLocal, right, rightStaticLocal) as mj:
         joinedBatchDf = mj.join(self._joinType,
                                 joinExpr,
@@ -443,7 +456,6 @@ class StreamToStreamJoinWithConditionForEachBatch:
   _finalSelectCols = None
   _dependentQuery = None
   _upstreamJoinCond = None
-  _stream = None
 
   def __init__(self,
                left,
@@ -503,7 +515,9 @@ class StreamToStreamJoinWithConditionForEachBatch:
 
   def __getitem__(self, key):
     from elzyme.streams import ColumnSelector
-    return ColumnSelector(self._stream, key)
+    if self._left.containsColumn(key):
+      return ColumnSelector(self._left, key)
+    return ColumnSelector(self._right, key)
 
   def partitionBy(self, *columns):
     from elzyme.streams import PartitionColumn
@@ -534,7 +548,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
     if windowSpec is not None:
       batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec)).where('__row_number = 1')
     else:
-      batchDf = batchDf.withColumn('__row_number', F.row_number().over(windowSpec2)).where('__row_number = 1').dropDuplicates(primaryKeys)
+      batchDf = batchDf.dropDuplicates(primaryKeys)
     return batchDf
 
   def _doMerge(self, deltaTable, cond, primaryKeys, sequenceWindowSpec, updateCols, matchCondition, batchDf, batchId):
@@ -768,8 +782,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = func
     else:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
-    self._stream = Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
-    return operationFunc(self._stream, joinQuery, joinCondFunc)
+    return operationFunc(Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys), joinQuery, joinCondFunc)
 
   def _union(self, other_df):
     return self.to(lambda s: s.union(other_df))

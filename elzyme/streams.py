@@ -159,6 +159,9 @@ class Stream:
   def path(self):
     return self._path
 
+  def containsColumn(self, column_name):
+    return column_name in self._stream.columns
+
   def columns(self):
     return [c for c in self._stream.columns if c not in Stream.excludedColumns]
 
