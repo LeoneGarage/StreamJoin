@@ -456,6 +456,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
   _finalSelectCols = None
   _dependentQuery = None
   _upstreamJoinCond = None
+  _stream = None
 
   def __init__(self,
                left,
@@ -515,9 +516,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
 
   def __getitem__(self, key):
     from elzyme.streams import ColumnSelector
-    if self._left.containsColumn(key):
-      return ColumnSelector(self._left, key)
-    return ColumnSelector(self._right, key)
+    return ColumnSelector(self._stream, key)
 
   def partitionBy(self, *columns):
     from elzyme.streams import PartitionColumn
@@ -782,7 +781,12 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = func
     else:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
-    return operationFunc(Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys), joinQuery, joinCondFunc)
+    self._stream = Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
+    sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
+    validColumns = [c for c in sequenceColumns if self._stream.containsColumn(c)]
+    if len(sequenceColumns) == len(validColumns):
+      self._stream = self._stream.sequenceBy(*sequenceColumns)
+    return operationFunc(self._stream, joinQuery, joinCondFunc)
 
   def _union(self, other_df):
     return self.to(lambda s: s.union(other_df))
