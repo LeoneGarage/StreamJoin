@@ -783,9 +783,10 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
     self._stream = Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
     sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
-    validColumns = [c for c in sequenceColumns if self._stream.containsColumn(c)]
-    if len(sequenceColumns) == len(validColumns):
-      self._stream = self._stream.sequenceBy(*sequenceColumns)
+    if sequenceColumns is not None and len(sequenceColumns) > 0:
+      validColumns = [c for c in sequenceColumns if self._stream.containsColumn(c)]
+      if len(sequenceColumns) == len(validColumns):
+        self._stream = self._stream.sequenceBy(*sequenceColumns)
     return operationFunc(self._stream, joinQuery, joinCondFunc)
 
   def _union(self, other_df):
