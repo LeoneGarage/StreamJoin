@@ -19,7 +19,7 @@ j = (
 # COMMAND ----------
 
 awaitInputTermination()
-j.awaitAllProcessedAndStop()
+j.awaitAllProcessedAndStop(shutdownLatencySecs = streamShutdownLatencySecs)
 
 # COMMAND ----------
 

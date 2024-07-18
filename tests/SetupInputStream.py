@@ -28,6 +28,10 @@ gold_path = f"/Users/{user}/tmp/demo/{notebook_name}/gold"
 
 # COMMAND ----------
 
+streamShutdownLatencySecs = 60
+
+# COMMAND ----------
+
 dbutils.fs.rm(checkpointLocation, True)
 dbutils.fs.rm(silver_path, True)
 dbutils.fs.rm(gold_path, True)
