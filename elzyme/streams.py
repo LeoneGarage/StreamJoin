@@ -105,6 +105,7 @@ class Stream:
   _catalog = None
   _schema = None
   _table_name = None
+  _commit_sequence_col_name = None
   excludedColumns = ['_commit_version', '_change_type']
 
   def __init__(self,
@@ -114,6 +115,8 @@ class Stream:
     self._stream = stream
     self._staticReader = staticReader
     self._isTable = isTable
+    self._commit_sequence_col_name = f"__commit_sequence_{str(uuid.uuid4()).replace("-", "")}"
+    self._stream = self._stream.withColumn(self._commit_sequence_col_name, F.col("_commit_version"))
 
   @staticmethod
   def readAtVersion(reader, version = None):
@@ -220,7 +223,7 @@ class Stream:
     return self._primaryKeys
 
   def sequenceBy(self, *columns):
-    self._sequenceColumns = columns
+    self._sequenceColumns = (self._commit_sequence_col_name,) + columns
     return self
   
   def getSequenceColumns(self):
