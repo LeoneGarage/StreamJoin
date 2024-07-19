@@ -13,6 +13,7 @@ import elzyme.utils
 class Selector:
   _left = None
   _right = None
+  _stream = None
   _joinType = None
   _joinExpr = None
   _transformFunc = None
@@ -20,11 +21,13 @@ class Selector:
   def __init__(self,
                left,
                right,
+               stream,
                joinType,
                onCondition,
                transformFunc):
     self._left = left
     self._right = right
+    self._stream = stream
     self._joinType = joinType
     self._joinExpr = onCondition
     self._transformFunc = transformFunc
@@ -117,11 +120,17 @@ class Selector:
     else:
       from elzyme.streams import ColumnSelector
       if isinstance(selectCols, tuple):
+        leftDict = {c:c for c in self._left.columns()}
+        rightDict = {c:c for c in self._right.columns()}
         # if '*' is specified convert to columns from left and right minus primary keys on right to avoid dups
         leftStars = [[ColumnSelector(self._left, lc) for lc in self._left.columns()] for c in selectCols if c == '*']
         rightStars = [[ColumnSelector(self._right, lc) for lc in self._right.columns()] for c in selectCols if c == '*']
         leftCols = [lc for arr in leftStars for lc in arr]
+        leftColsDict = {c.columnName():c.columnName() for c in leftCols}
+        leftCols += [ColumnSelector(self._left, c) for c in selectCols if c != '*' and leftDict.get(c) and not leftColsDict.get(c)]
         rightCols = [lc for arr in rightStars for lc in arr]
+        rightColsDict = {c.columnName():c.columnName() for c in rightCols}
+        rightCols += [ColumnSelector(self._right, c) for c in selectCols if c != '*' and rightDict.get(c) and not rightColsDict.get(c)]
         allCols = self._selectColumns(leftCols, rightCols)
         if len(allCols) > 0:
           return self.select(*allCols)
@@ -560,7 +569,7 @@ class StreamToStreamJoinWithConditionForEachBatch:
         .execute()
 
   def select(self, *selectCols):
-    (selectFunc, finalSelectFunc) = Selector(self._left, self._right, self._joinType, self._joinExpr, self._transformFunc).select(*selectCols)
+    (selectFunc, finalSelectFunc) = Selector(self._left, self._right, self._stream, self._joinType, self._joinExpr, self._transformFunc).select(*selectCols)
     return StreamToStreamJoinWithConditionForEachBatch(self._left,
                self._right,
                self._joinType,
@@ -749,9 +758,39 @@ class StreamToStreamJoinWithConditionForEachBatch:
     m.update(self._right.path().encode('ascii'))
     return f'{name}/{self._joinType}/{m.hexdigest()}'
 
-  def generateJoinStagingPath(self):
-    dir = os.path.dirname(self._right.path())
-    return f'{dir}/{self.generateJoinName()}'
+  def generateJoinTableName(self, volume_name = None, separator = "."):
+    if self._left.isTable():
+      catalog = self._left.getCatalog()
+      if catalog is None:
+        catalog = ""
+      schema = self._left.getSchema()
+      if not schema.startswith("__"):
+        schema = f"__{schema}"
+      path_arr = [catalog, schema]
+      if volume_name is not None:
+        path_arr.append(volume_name)
+      table_name = separator.join(path_arr + [self.generateJoinName().replace(".", "_").replace("/", "_").replace("$$", "_")])
+      return table_name
+    else:
+      dir = os.path.dirname(self._right.path())
+      return f'{dir}/{self.generateJoinName()}'
+
+  def generateJoinStagingPath(self, volume_name = None, separator = "."):
+    if self._left.isTable():
+      catalog = self._left.getCatalog()
+      if catalog is None:
+        catalog = ""
+      schema = self._left.getSchema()
+      if not schema.startswith("__"):
+        schema = f"__{schema}"
+      path_arr = [catalog, schema]
+      if volume_name is not None:
+        path_arr.append(volume_name)
+      path = separator.join(path_arr)
+      return path
+    else:
+      dir = os.path.dirname(self._right.path())
+      return f'{dir}/{self.generateJoinName()}'
 
   def _nonNullAndNullPrimaryKeys(self, joinType, leftPrimaryKeys, rightPrimaryKeys):
       if joinType == 'left':
@@ -763,13 +802,30 @@ class StreamToStreamJoinWithConditionForEachBatch:
 
   def _createStagingStream(self, stagingPath, operationFunc):
     from elzyme.streams import Stream
+    isNoStagingPath = (stagingPath is None)
     if stagingPath is None:
-      stagingPath = self.generateJoinStagingPath()
-    joinQuery = (
-                  self.writeToPath(f'{stagingPath}/data')
-                      .option('checkpointLocation', f'{stagingPath}/cp')
+      stagingPath = self.generateJoinStagingPath("checkpoints")
+    if isNoStagingPath and self._left.isTable():
+      catalog = self._left.getCatalog()
+      if catalog is None:
+        catalog = ""
+      schema = self._left.getSchema()
+      if not schema.startswith("__"):
+        schema = f"__{schema}"
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {'.'.join([catalog, schema])}")
+      if len(catalog) > 0:
+        spark.sql(f"CREATE VOLUME IF NOT EXISTS {stagingPath}")
+      joinQuery = (
+                  self.writeToTable(self.generateJoinTableName())
+                      .option('checkpointLocation', f'/Volumes/{self.generateJoinTableName("checkpoints", "/")}/cp')
                       .queryName(self.generateJoinName())
                 )
+    else:
+      joinQuery = (
+                    self.writeToPath(f'{stagingPath}/data')
+                        .option('checkpointLocation', f'{stagingPath}/cp')
+                        .queryName(self.generateJoinName())
+                  )
     primaryKeys = self._safeMergeLists(self._left.getPrimaryKeys(), self._right.getPrimaryKeys())
     if self._upstreamJoinCond is not None:
       def func():
@@ -781,7 +837,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
       joinCondFunc = func
     else:
       joinCondFunc = lambda: self._nonNullAndNullPrimaryKeys(self._joinType, [pk for pk in primaryKeys if pk in self._left.getPrimaryKeys()], [pk for pk in primaryKeys if pk in self._right.getPrimaryKeys()])
-    self._stream = Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
+    if isNoStagingPath and self._left.isTable():
+      join_table_name = self.generateJoinTableName()
+      self._stream = Stream.fromTable(join_table_name).setName(join_table_name).primaryKeys(*primaryKeys)
+    else:
+      self._stream = Stream.fromPath(f'{stagingPath}/data').setName(f'{self._left.name()}_{self._right.name()}').primaryKeys(*primaryKeys)
     sequenceColumns = self._safeMergeLists(self._left.getSequenceColumns(), self._right.getSequenceColumns())
     if sequenceColumns is not None and len(sequenceColumns) > 0:
       validColumns = [c for c in sequenceColumns if self._stream.containsColumn(c)]
@@ -883,7 +943,7 @@ class StreamToStreamJoinWithCondition:
     return self.select('*').writeToTable(tableName)
     
   def select(self, *selectCols):
-    (selectFunc, finalSelectFunc) = Selector(self._left, self._right, self._joinType, self._joinExpr, self._transformFunc).select(*selectCols)
+    (selectFunc, finalSelectFunc) = Selector(self._left, self._right, None, self._joinType, self._joinExpr, self._transformFunc).select(*selectCols)
     return StreamToStreamJoinWithConditionForEachBatch(self._left,
                self._right,
                self._joinType,

@@ -102,6 +102,9 @@ class Stream:
   _path = None
   _name = None
   _isTable = None
+  _catalog = None
+  _schema = None
+  _table_name = None
   excludedColumns = ['_commit_version', '_change_type']
 
   def __init__(self,
@@ -111,7 +114,7 @@ class Stream:
     self._stream = stream
     self._staticReader = staticReader
     self._isTable = isTable
-  
+
   @staticmethod
   def readAtVersion(reader, version = None):
     if version is not None:
@@ -143,6 +146,35 @@ class Stream:
   def __getitem__(self, key):
     return ColumnSelector(self, key)
   
+  def isTable(self):
+    return self._isTable
+  
+  def _getTableMetadata(self):
+    if self.isTable():
+      table_info = {r.col_name: r.data_type for r in spark.sql(f"DESCRIBE TABLE EXTENDED {self.name()}").where("col_name = 'Catalog' or col_name = 'Database' or col_name = 'Table'").collect()}
+      catalog = table_info.get("Catalog")
+      if catalog is None:
+        catalog = ""
+      schema = table_info["Database"]
+      table_name = table_info['Table']
+      return (catalog, schema, table_name)
+    return None
+
+  def getCatalog(self):
+    if self.isTable() and self._catalog is None and self._schema is None and self._table_name is None:
+      (self._catalog, self._schema, self._table_name) = self._getTableMetadata()
+    return self._catalog
+
+  def getSchema(self):
+    if self.isTable() and self._catalog is None and self._schema is None and self._table_name is None:
+      (self._catalog, self._schema, self._table_name) = self._getTableMetadata()
+    return self._schema
+
+  def getTableName(self):
+    if self.isTable() and self._catalog is None and self._schema is None and self._table_name is None:
+      (self._catalog, self._schema, self._table_name) = self._getTableMetadata()
+    return self._table_name
+
   def setName(self, name):
     self._name = name
     return self
