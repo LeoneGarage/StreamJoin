@@ -9,6 +9,7 @@ import os
 import hashlib
 import itertools
 import elzyme.utils
+import re
 
 class Selector:
   _left = None
@@ -329,7 +330,7 @@ class MicrobatchJoin:
       filter = [((newLeft[pk].isNotNull() & newRight[pk].isNotNull()) | (newLeft[pk].isNull() & newRight[pk].isNull())) for pk in primaryKeys]
     both = joinedOuter.where(reduce(lambda e, pk: e & pk, filter))
     both = both.select([F.coalesce(newLeft[c], newRight[c]).alias(c) for c in newLeft.columns])
-    both = dropDupKeys(transformFunc,
+    both = dropDupKeys(None, #transformFunc,
                       both, newLeft, newRight)
     both = selectFunc(both,
                       both,#newLeft,
@@ -630,7 +631,12 @@ class StreamToStreamJoinWithConditionForEachBatch:
         partitionColumnsExprFunc = pruneFunc
     return partitionColumnsExprFunc
 
-  def _writeToTarget(self, deltaTableForFunc, tableName, path):
+  def _getGeneratedColumns(self, tableName):
+    ddl_string = [r.createtab_stmt for r in spark.sql(f"SHOW CREATE TABLE {tableName}").collect()][0]
+    pattern = r"^\s*(\w+)\s+\w+\s+GENERATED\b"
+    return re.findall(pattern, ddl_string, re.MULTILINE)
+
+  def _writeToTarget(self, deltaTableForFunc, tableName, path, generated_columns_ddl):
     leftStatic = self._left.static()
     rightStatic = self._right.static()
     schemaDf = leftStatic.join(rightStatic, self._joinExpr(leftStatic, rightStatic), self._joinType)
@@ -638,6 +644,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
       schemaDf = self._transformFunc(schemaDf, leftStatic, rightStatic)
     schemaDf = schemaDf.select(self._finalSelectCols(schemaDf, leftStatic, rightStatic))
     ddl = schemaDf.schema.toDDL()
+    if generated_columns_ddl is not None and len(generated_columns_ddl) > 0:
+      ddl = ",".join([generated_columns_ddl, ddl])
     createSql = f'CREATE TABLE IF NOT EXISTS {tableName}({ddl}) USING DELTA TBLPROPERTIES (delta.enableChangeDataFeed = true, delta.autoOptimize.autoCompact = true, delta.autoOptimize.optimizeWrite = true)'
     if path is not None:
       createSql = f"{createSql} LOCATION '{path}'"
@@ -678,7 +686,8 @@ class StreamToStreamJoinWithConditionForEachBatch:
     matchCondition = None
     insertFilter = None
     updateFilter = None
-    deltaTableColumns = deltaTableForFunc().toDF().columns
+    generated_columns = self._getGeneratedColumns(tableName)
+    deltaTableColumns = [c for c in deltaTableForFunc().toDF().columns if c not in generated_columns]
     if len(pks[1]) > 0:
       outerCondStr = self._mergeCondition(pks[0], pks[1])
       if len(partitionColumns) > 0 and len(prunedPartitionColumns) == 0:
@@ -863,11 +872,11 @@ class StreamToStreamJoinWithConditionForEachBatch:
     return self._createStagingStream(stagingPath,
                           lambda stream, joinQuery, joinCondFunc: stream.groupBy(*cols)._chainStreamingQuery(joinQuery, joinCondFunc))
 
-  def writeToPath(self, path):
-    return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path)
+  def writeToPath(self, path, generated_columns_ddl=""):
+    return self._writeToTarget(lambda: DeltaTable.forPath(spark, path), f'delta.`{path}`', path, generated_columns_ddl)
 
-  def writeToTable(self, tableName):
-    return self._writeToTarget(lambda: DeltaTable.forName(spark, tableName), tableName, None)
+  def writeToTable(self, tableName, generated_columns_ddl=""):
+    return self._writeToTarget(lambda: DeltaTable.forName(spark, tableName), tableName, None, generated_columns_ddl)
 
 class StreamToStreamJoinWithCondition:
   _left = None
