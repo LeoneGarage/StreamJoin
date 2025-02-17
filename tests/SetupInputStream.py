@@ -9,7 +9,7 @@ from pathlib import Path
 
 # COMMAND ----------
 
-user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
+user = spark.sql("SELECT current_user()").collect()[0][0] #dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
 path = Path(dbutils.notebook.entry_point.getDbutils().notebook().getContext().extraContext().apply('notebook_path'))
 notebook_name = path.parts[len(path.parts)-1]
 

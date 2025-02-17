@@ -9,7 +9,7 @@ repo_subdir = dbutils.widgets.get("repo_subdir")
 
 import sys
 from pathlib import Path
-user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
+user = spark.sql("SELECT current_user()").collect()[0][0] #dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
 try:
   sys.path.remove(f'/Workspace/Repos/{user}/{repo_subdir}')
 except ValueError as e:

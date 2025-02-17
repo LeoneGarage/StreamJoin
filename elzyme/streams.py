@@ -6,7 +6,7 @@ import uuid
 import os
 from delta.tables import *
 
-spark.conf.set("spark.databricks.adaptive.autoBroadcastJoinThreshold", "2GB")
+# spark.conf.set("spark.databricks.adaptive.autoBroadcastJoinThreshold", "2GB")
 
 class ColumnSelector:
   _stream = None

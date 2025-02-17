@@ -7,7 +7,7 @@
 
 # COMMAND ----------
 
-user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().apply('user')
+user = spark.sql("SELECT current_user()").collect()[0][0]
 
 # COMMAND ----------
 
